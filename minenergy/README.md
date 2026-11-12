@@ -21,7 +21,7 @@ minenergy/
 │   ├── intervals.py      # 相邻样本 → 可积分区间 + 倍率分段
 │   ├── minutes.py        # 区间 → 分钟事实（跨分钟分摊、无效秒数、日历字段）
 │   ├── engine.py         # full_run / incremental_run
-│   ├── storage.py        # 原子写 Parquet 分区
+│   ├── storage.py        # 原子写 Parquet 分区 + 跨文件事务/恢复
 │   ├── settings.py       # 表计时区 + 空档阈值
 │   ├── reference.py      # 独立纯 Python 参考实现（精确有理数）
 │   ├── verify.py         # 差分对比与不变式检查、手写样例、随机场景
@@ -53,6 +53,8 @@ minenergy/
 | DST 回拨两个同名分钟用偏移区分 | `local_minute_label = 2025-11-02T01:30-0400 / …-0500`（`local_minute` 允许重复，标签唯一） |
 | 迟到样本/倍率更正只重算受影响区间并替换分钟分区 | `engine.incremental_run`：受影响窗口 = 变更时刻的 `[前驱, 后继]` 并集；配置变更额外覆盖 `[变更点前的样本, 下一配置点]`；只重算窗口内的区间，splice 回区间表，重写窗口触及的 `(meter_id, timezone, local_date)` 分区；`affected/<run_id>/intervals.parquet` + `minutes.parquet` 留存受影响清单 |
 | 原始样本与配置可落盘，退出再跑仍能识别修订 | 原始日志在 `raw/samples.parquet`、`raw/configs.parquet`；**每次运行都从完整原始日志重新 canonicalize**，因此进程重启、迟到修订都能识别 |
+| 多文件作业要么整体提交、要么整体回滚，中断后自动补完/撤销 | `storage.Transaction` + `recover_pending()`：全部产物先暂存，manifest 为完成边界，`COMMITTED` 为提交点；重跑以最后一次已提交 canonical 为基线，因此中断作业不会被误判 no-op（README 4.1） |
+| 重复启动/重传同一批不跳过待处理、不累加第二遍 | raw 追加按整行去重；已提交作业重跑是真正的 no-op；未提交作业在入口被恢复后再判定 |
 | 全量 + 增量两种入口 | `minenergy.cli full` / `minenergy.cli incremental`；另有 `ingest` 整目录分批 |
 | 随机多轮乱序输入 + 独立全量算法对照 | `tests/test_incremental.py`、`minenergy.compare`、`minenergy.cli verify`（`reference.py` 是不掩 bit 的纯 Python 精确有理数实现） |
 | 能量守恒、分钟覆盖 ≤60s、无采样分钟不被填零 | `verify.check_conservation`（全局）、`check_interval_conservation`（逐区间重切分钟）、`check_invariants`（覆盖 ≤60s、无零覆盖行、零用量需有有效覆盖） |
@@ -172,11 +174,76 @@ local_minute_label = 2025-11-02T01:30-0500   (utc_offset_seconds=-18000)
   facts/meter_id=<id>/timezone=<tz%2F>/local_date=<YYYY-MM-DD>/data.parquet
   affected/<run_id>/{intervals,minutes}.parquet + run.json
   state/settings.json                 # 上次运行的时区/阈值指纹
+  state/txn/<txid>/                   # 仅在作业进行中存在（见 4.1）
 ```
 
-所有写操作都是“临时文件 + `os.replace`”的原子替换；分钟区按
+所有单文件写操作都是“临时文件 + `os.replace`”的原子替换；分钟区按
 `(meter_id, timezone, local_date)` 分片，因此增量替换只触碰受影响日片。
 时区名路径按 URL 编码（`America%2FNew_York`），避免 `/` 破坏 hive 目录。
+
+### 4.1 跨文件提交协议
+
+单文件原子写**不等于**一次作业原子：一次增量会依次覆盖 raw、canonical、
+多个 `intervals/meter_id=…`、多个分钟分区、`state/settings.json`、
+`affected/<run_id>/` 与 `run.json`。旧实现先落 canonical、再与磁盘上的
+canonical 比较来决定“受影响范围”，所以进程若在 canonical 落盘后、区间/事实
+写盘前退出，下一次启动会把“尚未计算的新版本”当成“已经算过的版本”，整轮作业
+被判成 no-op，留下旧事实。
+
+现在的提交协议（`storage.py`）：
+
+1. **暂存（staging）**：作业开始时创建 `state/txn/<txid>/`，所有写入/删除都
+   先写到 `staged/` 并登记在内存操作表；读取 raw/canonical 时能看到本作业自己
+   的暂存版本，读取 intervals/facts 分区树时仍看**已提交基线**。
+2. **完成边界（manifest）**：作业的全部产物（含 `run.json`）都暂存完毕后，
+   `prepare()` 原子写出 `manifest.json`，列出每个目标路径与删除项。
+   它的存在即“工作已全部就绪”的判据。
+3. **提交点（COMMITTED）**：`commit()` 在文件锁内按 manifest 先移动所有暂存
+   文件、再执行删除，最后原子写 `COMMITTED` 标记。这个标记是整轮作业**唯一**
+   的提交点；之前任何时刻退出，磁盘上的有效状态都仍是上一次提交的完整状态。
+4. **恢复（recover）**：每个入口在读写前调用 `recover_pending()`：
+   * 有 `COMMITTED` 标记 → 作业已完成，只清理残留目录（**不重放** manifest，
+     否则会覆盖后续作业写下的同名文件）；
+   * 有 manifest、无标记 → 作业死在发布阶段，**向前重放** manifest
+     （暂存文件已移动的跳过，删除幂等），补写标记后清理；
+   * 无 manifest → 作业死在暂存阶段，未触碰任何正式路径，直接丢弃。
+   恢复过程再次被杀掉，下一次入口仍按同样判据继续，可反复恢复。
+
+**恢复判据一句话**：manifest 是“全部产物已暂存”的原子边界，COMMITTED 是
+“全部产物已发布”的原子边界；两者之间是可安全重放的发布阶段，两者之外都
+按“未提交→丢弃”或“已提交→清理”处理。因此重跑原命令时比较基线永远是上一
+次已提交的 canonical，不会把崩溃写下的中间 canonical 误认成“已完成”。
+
+**失败清理**：崩溃后残留的只有 `state/txn/<txid>/`（私有目录，读路径永不
+扫描它）。下一次任意入口的 `recover` 会依据上述判据补完或删除；正常异常
+（Python 异常）在 manifest 之前直接丢弃暂存目录，manifest 之后留给恢复流程
+补完。`raw` 追加按整行内容去重，重发同一批不会累加。
+
+**旧目录迁入**：旧版本写出的目录没有 `state/txn/`，无需转换——其现有文件
+就是第一次事务的“已提交基线”。第一次运行新版本的作业会照常比较并提交；
+若该目录在旧版本下写到了 canonical 但没写完事实，新版本会把 canonical 的
+差异当作待处理变更并重算受影响范围（因为比较对象是磁盘上旧的 canonical，
+而不是新代码某次中间写下的结果）。测试
+`test_legacy_store_without_txn_directory_is_usable` 覆盖了这一点。
+
+**并发**：`recover` 与 `commit` 在同一把 `state/.txn.lock` 文件锁下进行，因此
+恢复只会看到已死进程留下的目录，不会去动另一个进程正在发布的事务。同一
+store 上仍不建议两个**同时开始**的作业并发写；多作业串行时恢复会先补完前一
+个目的 manifest，后一个再以补完后的状态为基线。
+
+### 4.2 故障回归
+
+```bash
+./regression_crash_recovery.sh /tmp/minenergy-crash-regression
+```
+
+用两只电表、跨本地日边界的区间构造一轮会触及多个 interval 文件和多个分钟
+分区的作业，在**真实子进程**中以 `os._exit(77)` 在下列断点退出：raw 暂存后、
+canonical 后、首个 interval 前后、首个事实分区前后、变更说明前后、`run.json`
+前后、manifest 前后、发布过程中移动 1/2/3 个文件后、发布完成但无标记、提交
+完成后。每行打印该断点的真实退出码、恢复状态、是否落出 `run.json`、重跑是否
+为 no-op，以及整轮数据/变更说明是否与无中断的干净运行一致；发布阶段还会
+“恢复途中再退出一次再恢复”。退出码 0 表示所有断点均收敛。
 
 ---
 
@@ -241,7 +308,11 @@ python -m minenergy.compare --store /tmp/demo_compare \
   --batches samples/randomized/batches/*.parquet
 
 # pytest：6 个样例精确值 + 增量/全量/参考差分 + 属性（多随机种子）
+#  + 跨文件提交协议的多断点崩溃恢复（真实子进程 os._exit(77)）
 python -m pytest tests -q
+
+# 故障回归：逐断点打印真实退出码与恢复后的核对结果（README 4.2）
+./regression_crash_recovery.sh /tmp/minenergy-crash-regression
 
 # 或一条命令跑完整个验收流程（生成 → full → incremental → verify → compare → 6 样例 → pytest）
 ./demo.sh /tmp/minenergy-demo
@@ -289,9 +360,11 @@ python -m minenergy.cli show --store /tmp/demo_store --table runs
 
 ## 7. 增量算法
 
-1. 追加新原始数据；从**完整原始日志**重建 canonical 样本/配置（因此进程重启仍识别修订）。
-2. 与磁盘上上次 canonical 逐 `(meter_id, event_time_us)` 比较签名，得到变更时刻集合
-   （新增、删除、载荷/序号/冲突位变化）。
+1. 入口先 `recover` 上一次中断的作业（见 4.1），再追加新原始数据；从**完整原始日志**
+   重建 canonical 样本/配置（因此进程重启仍识别修订）。
+2. 与磁盘上**上次已提交**的 canonical 逐 `(meter_id, event_time_us)` 比较签名，得到
+   变更时刻集合（新增、删除、载荷/序号/冲突位变化）。本作业新写的 canonical 只在
+   暂存区，不参与基线比较。
 3. 受影响窗口：每个变更时刻取 `[前驱, 后继]`（在旧∪新时刻集合内），合并相邻窗口。
    配置变更额外给出 `[变更点前的样本, 下一配置点前/后]` 的窗口。
 4. 只在这些窗口内重跑 `derive_intervals`，并把结果 splice 回每表计的区间文件。
@@ -299,8 +372,11 @@ python -m minenergy.cli show --store /tmp/demo_store --table runs
    只重算并重写这些分区（仅用该日相关的区间切片），其余分区保持不动。
 6. 受影响区间清单与分钟清单写 `affected/<run_id>/`；`run.json` 记录窗口、变更时刻数、
    重算区间数、写/删分区数、耗时。
+7. 以上全部产物都在同一事务中暂存，`prepare` 后由 `commit` 一次性发布；只有
+   `COMMITTED` 标记出现后新进程才会把这一轮视为已完成。
 
 > 缓冲区只取“真正相邻”的一个前驱/后继：窗口外的区间与本次变更完全无关，因此不重算。
+> 正常作业仍走局部重算路径：事务只改变“何时可见”，不改变“算多少”。
 
 ---
 

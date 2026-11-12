@@ -11,6 +11,16 @@ those intervals from a scoped slice of canonical samples, splices them into the
 stored interval table and rewrites only the minute partitions that the affected
 spans touch.  The list of affected intervals and minutes is persisted under
 ``affected/<run_id>/``.
+
+Every run is one transaction (``storage.Transaction``): raw append, canonical
+revision, interval partitions, minute partitions, settings fingerprint, the
+affected reports and ``run.json`` are all staged first and published together
+behind a single commit marker.  The comparison that decides what is "new" is
+always made against the last *committed* canonical files, never against bytes
+that a previous, unfinished attempt happened to write.  On entry the engine
+replays or discards any interrupted transaction before reading, so restarting
+the original command always redoes the work that was not committed.  A fully
+committed run is a genuine no-op when repeated.
 """
 from __future__ import annotations
 
@@ -36,6 +46,8 @@ from .schema import (
     CANONICAL_SAMPLE_DTYPES,
     INTERVAL_DTYPES,
     MINUTE_US,
+    RAW_CONFIG_DTYPES,
+    RAW_SAMPLE_DTYPES,
 )
 from .settings import (
     MeterSettings,
@@ -374,34 +386,44 @@ def _values_equal(a, b) -> bool:
 # public entry points
 # ---------------------------------------------------------------------------
 def full_run(
-    store_root: str | Path, settings_path: str | Path, run_id: str | None = None
+    store_root: str | Path,
+    settings_path: str | Path,
+    run_id: str | None = None,
+    new_samples: pl.DataFrame | None = None,
+    new_configs: pl.DataFrame | None = None,
 ) -> RunResult:
     started = time.perf_counter()
     run_id = run_id or _new_run_id("full")
     store = Store(store_root)
     settings = load_settings(settings_path)
 
-    raw_samples = store.read_raw_samples()
-    raw_configs = store.read_raw_configs()
-    canon, sample_conflicts = canonicalize_samples(raw_samples)
-    canon_cfg, config_conflicts = canonicalize_configs(raw_configs)
-    store.write_canonical(canon, canon_cfg, sample_conflicts, config_conflicts)
+    # begin() first finishes or discards any job an earlier process left in
+    # flight; reads below therefore start from the last committed baseline.
+    txn = store.begin()
+    try:
+        # Seeding lives inside the same transaction as the recompute, so a
+        # retried "seed + full" publishes the raw log and the facts together.
+        if (new_samples is not None and new_samples.height) or (
+            new_configs is not None and new_configs.height
+        ):
+            store.append_raw(new_samples, new_configs)
+        raw_samples = store.read_raw_samples()
+        raw_configs = store.read_raw_configs()
+        canon, sample_conflicts = canonicalize_samples(raw_samples)
+        canon_cfg, config_conflicts = canonicalize_configs(raw_configs)
 
-    meter_map = _meter_map(canon, canon_cfg, settings)
-    intervals = derive_intervals(canon, canon_cfg, meter_map)
-    store.replace_all_intervals(intervals)
-
-    minutes = build_minutes(intervals, meter_map)
-    written = store.replace_all_fact_partitions(minutes)
-    store.write_settings_fingerprint(settings_fingerprints(settings, sorted(meter_map)))
-
-    empty_i = pl.DataFrame(schema=AFFECTED_INTERVAL_DTYPES)
-    empty_m = pl.DataFrame(schema=AFFECTED_MINUTE_DTYPES)
-    store.write_affected(run_id, empty_i, empty_m)
-    elapsed = round(time.perf_counter() - started, 3)
-    store.write_run_meta(
-        run_id,
-        {
+        meter_map = _meter_map(canon, canon_cfg, settings)
+        intervals = derive_intervals(canon, canon_cfg, meter_map)
+        minutes = build_minutes(intervals, meter_map)
+        empty_i = pl.DataFrame(schema=AFFECTED_INTERVAL_DTYPES)
+        empty_m = pl.DataFrame(schema=AFFECTED_MINUTE_DTYPES)
+        store.write_canonical(canon, canon_cfg, sample_conflicts, config_conflicts)
+        store.replace_all_intervals(intervals)
+        written = store.replace_all_fact_partitions(minutes)
+        store.write_settings_fingerprint(settings_fingerprints(settings, sorted(meter_map)))
+        store.write_affected(run_id, empty_i, empty_m)
+        elapsed = round(time.perf_counter() - started, 3)
+        meta = {
             "run_id": run_id,
             "mode": "full",
             "raw_samples": raw_samples.height,
@@ -413,8 +435,13 @@ def full_run(
             "minute_rows": minutes.height,
             "partitions_written": len(written),
             "elapsed_seconds": elapsed,
-        },
-    )
+        }
+        store.write_run_meta(run_id, meta)
+        txn.prepare(meta)
+        txn.commit()
+    except BaseException:
+        txn.abort()
+        raise
     return RunResult(
         run_id=run_id,
         mode="full",
@@ -438,11 +465,41 @@ def incremental_run(
     store = Store(store_root)
     settings = load_settings(settings_path)
 
+    # begin() first finishes or discards any job an earlier process left in
+    # flight; reads below therefore start from the last committed baseline.  A
+    # crashed attempt's canonical revision can never be mistaken for one that
+    # was already applied, and a committed run is a genuine no-op on replay.
+    txn = store.begin()
+    try:
+        return _incremental_run_in_txn(
+            store,
+            txn,
+            settings,
+            run_id,
+            started,
+            new_samples,
+            new_configs,
+        )
+    except BaseException:
+        txn.abort()
+        raise
+
+
+def _incremental_run_in_txn(
+    store: Store,
+    txn,
+    settings: dict,
+    run_id: str,
+    started: float,
+    new_samples: pl.DataFrame | None,
+    new_configs: pl.DataFrame | None,
+) -> RunResult:
     if (new_samples is not None and new_samples.height) or (
         new_configs is not None and new_configs.height
     ):
         store.append_raw(new_samples, new_configs)
 
+    # Reads see only committed files; this run's own writes are staged.
     old_canon = store.read_canonical_samples()
     old_cfg = store.read_canonical_configs()
     old_intervals = store.read_intervals()
@@ -470,23 +527,36 @@ def incremental_run(
 
     affected_meters = sorted(set(cfg_changed) | set(sample_changed) | set(settings_changed))
     if not affected_meters:
-        store.write_settings_fingerprint(current_fp)
         empty_i = pl.DataFrame(schema=AFFECTED_INTERVAL_DTYPES)
         empty_m = pl.DataFrame(schema=AFFECTED_MINUTE_DTYPES)
-        store.write_affected(run_id, empty_i, empty_m)
+        # A recovered job (crashed after it had prepared its manifest, resumed
+        # by begin()) may already carry this run_id's completed report on disk.
+        # A later retry of the same command must not erase that description:
+        # keep the committed report and metadata untouched and only record the
+        # (unchanged) settings fingerprint.
+        previous = store.read_run_meta(run_id)
+        keep_report = bool(previous) and previous.get("no_op") is not True
         elapsed = round(time.perf_counter() - started, 3)
-        store.write_run_meta(
-            run_id,
-            {
-                "run_id": run_id,
-                "mode": "incremental",
-                "no_op": True,
-                "affected_meters": [],
-                "elapsed_seconds": elapsed,
-            },
-        )
+        if keep_report:
+            store.write_settings_fingerprint(current_fp)
+            txn.prepare({"run_id": run_id, "mode": "incremental", "no_op": True,
+                         "reused_commit": True})
+            txn.commit()
+            return RunResult(run_id, "incremental", empty_i, empty_m, [],
+                             elapsed_seconds=elapsed)
+        store.write_settings_fingerprint(current_fp)
+        store.write_affected(run_id, empty_i, empty_m)
+        meta = {
+            "run_id": run_id,
+            "mode": "incremental",
+            "no_op": True,
+            "affected_meters": [],
+            "elapsed_seconds": elapsed,
+        }
+        store.write_run_meta(run_id, meta)
+        txn.prepare(meta)
+        txn.commit()
         return RunResult(run_id, "incremental", empty_i, empty_m, [], elapsed_seconds=elapsed)
-
     union_instants: dict[str, list[int]] = {}
     union_frame = pl.concat(
         [
@@ -623,24 +693,24 @@ def incremental_run(
     store.write_settings_fingerprint(current_fp)
     store.write_affected(run_id, report, report_minutes)
     elapsed = round(time.perf_counter() - started, 3)
-    store.write_run_meta(
-        run_id,
-        {
-            "run_id": run_id,
-            "mode": "incremental",
-            "affected_meters": affected_meters,
-            "changed_sample_instants": {m: len(v) for m, v in sample_changed.items()},
-            "changed_config_instants": {m: len(v) for m, v in cfg_changed.items()},
-            "settings_changed_meters": settings_changed,
-            "windows": {m: windows[m] for m in affected_meters},
-            "intervals_recomputed": recomputed,
-            "affected_intervals": report.height,
-            "affected_minutes": report_minutes.height,
-            "partitions_written": len(written_paths),
-            "partitions_removed": len(removed_paths),
-            "elapsed_seconds": elapsed,
-        },
-    )
+    meta = {
+        "run_id": run_id,
+        "mode": "incremental",
+        "affected_meters": affected_meters,
+        "changed_sample_instants": {m: len(v) for m, v in sample_changed.items()},
+        "changed_config_instants": {m: len(v) for m, v in cfg_changed.items()},
+        "settings_changed_meters": settings_changed,
+        "windows": {m: windows[m] for m in affected_meters},
+        "intervals_recomputed": recomputed,
+        "affected_intervals": report.height,
+        "affected_minutes": report_minutes.height,
+        "partitions_written": len(written_paths),
+        "partitions_removed": len(removed_paths),
+        "elapsed_seconds": elapsed,
+    }
+    store.write_run_meta(run_id, meta)
+    txn.prepare(meta)
+    txn.commit()
     return RunResult(
         run_id=run_id,
         mode="incremental",

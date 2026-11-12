@@ -1,0 +1,4 @@
+[console_scripts]
+minenergy = minenergy.cli:main
+minenergy-compare = minenergy.compare:main
+minenergy-generate = minenergy.generate:main

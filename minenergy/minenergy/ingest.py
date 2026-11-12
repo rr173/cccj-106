@@ -14,24 +14,40 @@ from .engine import full_run, incremental_run
 from .storage import Store
 
 
+def _run_one(
+    store: Store,
+    settings: Path,
+    mode: str,
+    raw: pl.DataFrame | None,
+    configs: pl.DataFrame | None,
+    run_id: str,
+):
+    """Run exactly one job (``full``/``incremental``) as a single transaction.
+
+    Recovery first, in case a previous invocation was interrupted: the retry
+    then starts from the last committed state.  Replaying a committed batch is
+    idempotent because raw rows are deduplicated and canonical is derived from
+    the full raw log.
+    """
+    if mode == "full":
+        return full_run(store.root, settings, run_id=run_id, new_samples=raw, new_configs=configs)
+    return incremental_run(store.root, settings, run_id=run_id, new_samples=raw, new_configs=configs)
+
+
 def ingest_directory(store: Path, settings: Path, batch_dir: Path, configs: Path | None):
     """First batch seeds the store via ``full``; the rest go incremental."""
     batches = sorted(Path(batch_dir).glob("*.parquet"))
     if not batches:
         raise SystemExit(f"no parquet batches in {batch_dir}")
     s = Store(store)
+    s.recover()
     config_frame = pl.read_parquet(configs) if configs else None
     timings = []
     for i, batch in enumerate(batches):
         t0 = time.perf_counter()
         raw = pl.read_parquet(batch)
-        if i == 0:
-            s.append_raw(raw, config_frame)
-            result = full_run(store, settings, run_id=f"batch-{i:02d}")
-        else:
-            result = incremental_run(
-                store, settings, run_id=f"batch-{i:02d}", new_samples=raw
-            )
+        mode = "full" if i == 0 else "incremental"
+        result = _run_one(s, settings, mode, raw, config_frame, f"batch-{i:02d}")
         entry = {
             "batch": batch.name,
             "run_id": result.run_id,

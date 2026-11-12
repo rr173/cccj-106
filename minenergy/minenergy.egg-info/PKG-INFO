@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: minenergy
+Version: 1.0.0
+Summary: Industrial sample counter -> minute energy fact table (Polars/Parquet)
+Requires-Python: >=3.11
+Requires-Dist: polars>=1.0
+Requires-Dist: pyarrow>=15
+Provides-Extra: test
+Requires-Dist: pytest>=8; extra == "test"

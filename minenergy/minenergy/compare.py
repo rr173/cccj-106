@@ -94,8 +94,10 @@ def replay_batches(
         raw = pl.read_parquet(batch)
         t0 = time.perf_counter()
         if i == 0:
-            s.append_raw(raw, config_frame)
-            res = full_run(store, settings, run_id=f"replay-{i:02d}")
+            res = full_run(
+                store, settings, run_id=f"replay-{i:02d}",
+                new_samples=raw, new_configs=config_frame,
+            )
         else:
             res = incremental_run(
                 store, settings, run_id=f"replay-{i:02d}", new_samples=raw

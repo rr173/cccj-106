@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -73,17 +72,22 @@ def _read_any(path: str) -> pl.DataFrame:
 
 def cmd_full(args) -> int:
     store = Path(args.store)
-    if args.samples or args.configs:
-        # seed the raw log before the full recompute
-        if args.samples:
-            Store(store).append_raw(
-                samples=_sample_frame_from_any(_read_many(args.samples)), configs=None
-            )
-        if args.configs:
-            Store(store).append_raw(
-                samples=None, configs=_config_frame_from_any(_read_many(args.configs))
-            )
-    result = full_run(store, args.settings, run_id=args.run_id)
+    new_samples = (
+        _sample_frame_from_any(_read_many(args.samples)) if args.samples else None
+    )
+    new_configs = (
+        _config_frame_from_any(_read_many(args.configs)) if args.configs else None
+    )
+    # Seeding and recompute are one transaction inside full_run: an interrupted
+    # "full --samples ..." can be re-run and neither the raw append nor the
+    # canonical/fact publication is applied twice.
+    result = full_run(
+        store,
+        args.settings,
+        run_id=args.run_id,
+        new_samples=new_samples,
+        new_configs=new_configs,
+    )
     print(result.summary())
     facts = Store(store).read_facts()
     if facts.height:
