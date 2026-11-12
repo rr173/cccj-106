@@ -1,0 +1,20 @@
+{
+  "defaults": {
+    "timezone": "UTC",
+    "gap_threshold_seconds": 3600
+  },
+  "meters": {
+    "M0": {
+      "timezone": "America/New_York",
+      "gap_threshold_seconds": 1800
+    },
+    "M1": {
+      "timezone": "Asia/Kolkata",
+      "gap_threshold_seconds": 3600
+    },
+    "M2": {
+      "timezone": "America/New_York",
+      "gap_threshold_seconds": 300
+    }
+  }
+}

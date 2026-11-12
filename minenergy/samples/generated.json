@@ -1,0 +1,11 @@
+{
+  "dir": "samples/randomized",
+  "settings": "samples/randomized/settings.json",
+  "batches": [
+    "samples/randomized/batches/batch_00.parquet",
+    "samples/randomized/batches/batch_01.parquet",
+    "samples/randomized/batches/batch_02.parquet",
+    "samples/randomized/batches/batch_03.parquet"
+  ],
+  "configs": "samples/randomized/configs_all.parquet"
+}

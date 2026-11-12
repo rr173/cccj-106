@@ -1,0 +1,12 @@
+{
+  "defaults": {
+    "timezone": "UTC",
+    "gap_threshold_seconds": 3600
+  },
+  "meters": {
+    "M3": {
+      "timezone": "UTC",
+      "gap_threshold_seconds": 300
+    }
+  }
+}

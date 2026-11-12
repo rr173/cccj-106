@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minenergy"
+version = "1.0.0"
+description = "Industrial sample counter -> minute energy fact table (Polars/Parquet)"
+requires-python = ">=3.11"
+dependencies = ["polars>=1.0", "pyarrow>=15"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+minenergy = "minenergy.cli:main"
+minenergy-generate = "minenergy.generate:main"
+minenergy-compare = "minenergy.compare:main"
+
+[tool.setuptools.packages.find]
+include = ["minenergy*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
