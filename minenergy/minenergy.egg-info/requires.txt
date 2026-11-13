@@ -1,5 +1,9 @@
 polars>=1.0
 pyarrow>=15
 
+[opccollect]
+asyncua>=1.0
+
 [test]
 pytest>=8
+pytest-asyncio>=0.23

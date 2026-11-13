@@ -55,7 +55,18 @@ minenergy/
 │       ├── scenario.py   # 值班案例（两源/联络环/平行线/孤立表）+ 手算依据
 │       ├── errors.py     # 带清册下标与操作编号的聚合错误类型
 │       └── cli.py        # history / trace / drill / make-case / demo
+├── minenergy/opccollect/  # OPC UA 在线采集：永久身份订阅 + 原样留痕（见第 12 节）
+│       ├── contract.py     # 节点契约（namespace URI+标识符）、类型边界、配置校验
+│       ├── storage.py      # 独立 SQLite 历史（采集段/连接空档/通知）+ Arrow 读出
+│       ├── collector.py    # asyncua 客户端：订阅、有界队列、退避重连、显式失败
+│       ├── server_fixture.py # 可重建本地 OPC UA 服务（占位 namespace/URI 消失/类型漂移）
+│       ├── faults.py       # 写盘异常/写阻塞（小队列溢出）故障注入
+│       ├── testing.py      # 测试/演示用配置与端口辅助
+│       ├── demo.py         # 现场断线演练编排（真实子进程 + 断言）
+│       ├── errors.py       # 带节点与原因的错误类型
+│       └── cli.py          # run / query / inspect / fixture
 ├── gridtrace_demo.sh     # 一条命令在新临时目录重建案例并跑完验收
+├── opccollect_demo.sh    # 一条命令跑完 OPC UA 现场断线演练与验收
 ├── samples/
 │   ├── fixtures/         # 6 个命名小样例（生成产物 + settings）
 │   └── randomized/       # 4 批乱序随机样例（生成产物 + settings）
@@ -843,3 +854,153 @@ python -m pytest tests/gridtrace -q       # 手算工单 + 拒绝案例 + 随机
 对象等）以退出码 2 拒绝，信息带对象/记录定位。gridtrace 与既有读数/录波
 功能完全解耦：`python -m pytest tests -q` 跑全量回归（含第 10 节 COMTRADE
 与 Flight 套件）互不影响。
+
+---
+
+## 12. OPC UA 在线采集（opccollect）
+
+把现场的累计电表与设备状态从"人工抄表"换成**在线接收管线**：通过真实 OPC UA
+协议订阅指定节点，把每次通知的 DataValue **原样留痕**到一个独立 SQLite 历史，
+供后续加工使用。本节功能与第 2–11 节完全解耦——**不计算分钟用量、不做录波
+解析、不做配电图推演、不提供网页**，接收历史也不进入既有能耗 store 的跨文件
+事务，两者目录分开。
+
+### 12.1 永久身份与节点契约
+
+节点身份**只**由 `namespace_uri + identifier` 构成，identifier 只接受数值型
+（OPC UA `i=`）或字符串型（`s=`）。服务器当前分配的 namespace 下标**永远不进
+契约、不持久化**：每次（重）连接都先读服务器 `NamespaceArray`，用 URI 换出当
+下真实下标再构造 NodeId。服务器重启把同一 URI 换到另一下标时，采集到的仍是同
+一个永久节点的连续历史；若 URI 消失或节点实际类型与契约不符，则**明确结束本
+次采集并保留既有记录**，不会接到另一个节点或换类型混写。
+
+每个节点带一个使用者查询用的稳定 `alias` 与显式 `value_type`。支持的类型与
+Arrow 列类型（实际类型由节点契约决定，绝不共用一个字符串 value 列）：
+
+| 契约类型 | Arrow 类型 | 契约类型 | Arrow 类型 |
+|---|---|---|---|
+| `Int64` | `int64` | `Int64_array` | `list<int64>` |
+| `Double` | `double` | `Double_array` | `list<double>` |
+| `Boolean` | `bool` | `Boolean_array` | `list<bool>` |
+| `String` | `utf8 string` | `String_array` | `list<string>` |
+| `ByteString` | `binary` | `ByteString_array` | `list<binary>` |
+
+配置示例（完整样例见 `samples/opccollect/config.json`）：
+
+```json
+{
+  "endpoint": "opc.tcp://127.0.0.1:4840",
+  "queue_capacity": 10000,
+  "batch_max_rows": 500,
+  "nodes": [
+    {"alias": "meter_total", "namespace_uri": "urn:minenergy:opccollect:field",
+     "identifier": {"kind": "numeric", "value": 1001}, "value_type": "Int64"},
+    {"alias": "running", "namespace_uri": "urn:minenergy:opccollect:field",
+     "identifier": {"kind": "string", "value": "RUNNING"}, "value_type": "Boolean"}
+  ]
+}
+```
+
+### 12.2 原样留痕的语义边界
+
+每条通知都记录：源时间、服务器时间、**完整 StatusCode（uint32 与名称）**、
+采集机实际收到时间，以及按契约类型分列存储的值。
+
+| 规则 | 处理 |
+|---|---|
+| 设备时间缺失 | `source_us/server_us` 存 `NULL`，**不用接收时间回填** |
+| 非 Good 质量 | 原质量码保留、`usable=0`，行不丢弃也不改写成 0 |
+| 接收顺序 | 节点内 `node_seq` 与全局 `arrival_seq` 按回调到达顺序分配，**不按源时间排序冒充到达顺序** |
+| 同源时间不同值 | 两条通知各占一个编号，都保留 |
+| 空数组 vs 空值 | 空数组（`[]`）与 `NULL` 是两种不同存储，明确区分 |
+| 数组空元素 | String/ByteString 数组元素可为 null 并原样还原；数值/布尔数组的 null 元素在 OPC UA 二进制下不可编码，收到即报 `UnsupportedValueError` |
+| 不支持的形状/类型 | 多维数组、VariantType 与契约不符都带节点别名报错，**不猜成字符串继续收** |
+
+关于坏质量的一个协议事实（OPC UA Part 4 §7.7.1）：写入的 StatusCode 为 **Bad**
+时，合规服务器必须忽略携带值并把它置成 Null，因此采集端收到的是 *Null Variant
++ 原 Bad 质量码*；`Uncertain` 不是 Bad，值会原样保留。两种形态都会留痕，后续
+加工凭 `usable` 与 `status_code` 区分"设备发来了坏质量读数"与"采集连接断过、
+根本没有收到读数"（后者只体现在连接空档里，不会产生任何通知行）。本实现**不
+声称**实现了服务器到采集机的恰好一次投递。
+
+### 12.3 SQLite 历史与 Arrow 读出
+
+独立库内四张表：`contracts`（契约，新进程据此恢复类型绑定与永久身份）、
+`segments`（每次采集进程一段：`running/completed/failed`）、
+`connection_events`（连接/断开/尝试失败）、`notifications`（每条通知一行，值
+按类型进 `value_int/value_real/value_bool/value_text/value_json/value_blob`
+不同列）。时间统一为 UTC 微秒整数；ByteString 数组用长度前缀帧编码以保留元素
+级 null 与全部字节。
+
+读出接口（可在**另一个进程**只读并发打开）：
+
+```python
+from minenergy.opccollect import HistoryStore, HistoryReader
+
+store = HistoryStore("history.sqlite")          # 写端
+with HistoryReader("history.sqlite") as reader:  # 读端（独立只读连接）
+    contract = reader.contract("meter_total")   # 新进程恢复契约/Arrow 类型
+    for batch in reader.read_record_batches("meter_total", first_seq=10, last_seq=20):
+        ...  # pyarrow.RecordBatch，value 列类型由契约决定
+```
+
+RecordBatch 的 schema metadata 带 `namespace_uri / identifier / value_type`，
+导出记录仍能对应回配置里的永久身份；也可用 CLI 导出 Parquet。
+
+### 12.4 断线、重连与空档
+
+* 重连用**有上限间隔的指数退避**（初始/上限可配），恢复时**重新解析
+  NamespaceArray 并重新订阅**，不沿用旧下标的 NodeId；
+* 已建立会话后的断开写 `session_disconnected`，无法确定精确瞬间时同时记录
+  `last_observed_us`（最后一次成功探测）与 `observed_us`（判定断线）两个已知
+  边界，**不编造完整覆盖**；对端未就绪期间的重试单独写
+  `connect_attempt_failed`，本机空档不会被标成设备停电；
+* URI 消失 / 类型不符是致命错误：采集段记 `failed` 后退出（CLI 退出码 2），
+  旧历史保留可读；
+* 采集机退出再开生成**新的一段** `segments` 记录，接收顺序号在库内单调续编，
+  不伪装成中间没有空档。
+
+### 12.5 有界管线与失败诚实性
+
+通知 → 有界 `asyncio.Queue`（容量可配）→ 写协程按**有界批次**（行数/延迟双
+阈值）单事务提交。队列满即 `QueueOverflowError` 显式失败；写盘失败即
+`StorageWriteError`，都把本次采集记为 `failed` 并写明未完整接收的事实，
+**不允许丢弃通知后仍报告完整成功**。正常停止先排空已入队通知、核对
+`received_count == committed_count`，再结束采集段，最后关闭订阅、客户端与
+数据库连接。
+
+### 12.6 命令
+
+```bash
+# 一次采集（--run-ms 仅用于演示；生产环境用 SIGTERM/SIGINT 正常停止）
+python -m minenergy.opccollect.cli run --config cfg.json --db history.sqlite
+# 按节点 + 接收编号范围读出 RecordBatch（summary/json/parquet）
+python -m minenergy.opccollect.cli query --db history.sqlite --alias meter_total \
+       --first-seq 10 --last-seq 20
+# 查看契约恢复、采集段与连接空档
+python -m minenergy.opccollect.cli inspect --db history.sqlite
+# 可重建的本地 OPC UA 服务端夹具（带 JSON-lines 控制口）
+python -m minenergy.opccollect.cli fixture --opc-port 4840 --control-port 4841 \
+       [--placeholder-count N] [--omit-business-uri] [--type-change]
+```
+
+### 12.7 现场断线演练与验收
+
+```bash
+./opccollect_demo.sh /tmp/minenergy-opccollect-demo
+```
+
+演练全部走**真实子进程与真实 OPC UA socket**（不是直接调用回调）：
+
+1. 订阅标量与数组节点，发已知值、一个非 Good 质量读数、同源时间不同值的连续
+   更新，停下后**从另一个进程**读回 Arrow 核对类型、质量码、空值与到达顺序；
+2. 真的停掉服务，再以相同端点重启并预注册占位 namespace（业务 URI 下标从 2
+   变 4），恢复后继续发值，证明历史仍挂在同一永久节点、没有串到占位节点，并
+   展示带已知边界的连接空档；
+3. 失败场景：节点类型漂移、URI 消失、写盘异常、小队列溢出——逐一确认退出码
+   2、采集段 `failed`、失败原因落库、已有历史仍可读；
+4. 持续通知下观察缓冲有界，并核对正常结束时接收量与已提交量一致。
+
+`python -m pytest tests/opccollect -q` 覆盖契约/类型边界、接收语义、断线
+重连、退避有界性、故障注入、SQLite/Arrow 往返与 CLI 子进程；`tests/` 全量
+回归（含原有全部套件）互不影响。

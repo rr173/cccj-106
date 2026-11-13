@@ -45,6 +45,16 @@ minenergy/gridtrace/scenario.py
 minenergy/gridtrace/snapshot.py
 minenergy/gridtrace/timeutil.py
 minenergy/gridtrace/tracing.py
+minenergy/opccollect/__init__.py
+minenergy/opccollect/cli.py
+minenergy/opccollect/collector.py
+minenergy/opccollect/contract.py
+minenergy/opccollect/demo.py
+minenergy/opccollect/errors.py
+minenergy/opccollect/faults.py
+minenergy/opccollect/server_fixture.py
+minenergy/opccollect/storage.py
+minenergy/opccollect/testing.py
 tests/test_crash_recovery.py
 tests/test_fixtures.py
 tests/test_flight.py

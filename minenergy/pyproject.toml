@@ -10,7 +10,8 @@ requires-python = ">=3.11"
 dependencies = ["polars>=1.0", "pyarrow>=15"]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+opccollect = ["asyncua>=1.0"]
 
 [project.scripts]
 minenergy = "minenergy.cli:main"
@@ -21,6 +22,7 @@ minenergy-flight-client = "minenergy.flight_client:main"
 minenergy-flight-demo-data = "minenergy.flight_demo_data:main"
 minenergy-comtrade = "minenergy.comtrade.cli:main"
 minenergy-gridtrace = "minenergy.gridtrace.cli:main"
+minenergy-opccollect = "minenergy.opccollect.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["minenergy*"]
@@ -28,3 +30,8 @@ include = ["minenergy*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "asyncio: asyncio-driven test (pytest-asyncio)",
+]

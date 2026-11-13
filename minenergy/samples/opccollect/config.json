@@ -1,0 +1,72 @@
+{
+  "endpoint": "opc.tcp://127.0.0.1:4840",
+  "publishing_interval_ms": 100.0,
+  "sampling_interval_ms": 50.0,
+  "reconnect_backoff_initial_ms": 200.0,
+  "reconnect_backoff_max_ms": 5000.0,
+  "queue_capacity": 10000,
+  "batch_max_rows": 500,
+  "batch_max_delay_ms": 200.0,
+  "nodes": [
+    {
+      "alias": "meter_total",
+      "namespace_uri": "urn:minenergy:opccollect:field",
+      "identifier": {"kind": "numeric", "value": 1001},
+      "value_type": "Int64"
+    },
+    {
+      "alias": "voltage",
+      "namespace_uri": "urn:minenergy:opccollect:field",
+      "identifier": {"kind": "numeric", "value": 1002},
+      "value_type": "Double"
+    },
+    {
+      "alias": "raw_frame",
+      "namespace_uri": "urn:minenergy:opccollect:field",
+      "identifier": {"kind": "numeric", "value": 1003},
+      "value_type": "ByteString"
+    },
+    {
+      "alias": "running",
+      "namespace_uri": "urn:minenergy:opccollect:field",
+      "identifier": {"kind": "string", "value": "RUNNING"},
+      "value_type": "Boolean"
+    },
+    {
+      "alias": "device_name",
+      "namespace_uri": "urn:minenergy:opccollect:field",
+      "identifier": {"kind": "string", "value": "DEVICE_NAME"},
+      "value_type": "String"
+    },
+    {
+      "alias": "waveform",
+      "namespace_uri": "urn:minenergy:opccollect:field",
+      "identifier": {"kind": "numeric", "value": 1101},
+      "value_type": "Int64_array"
+    },
+    {
+      "alias": "doubles",
+      "namespace_uri": "urn:minenergy:opccollect:field",
+      "identifier": {"kind": "numeric", "value": 1103},
+      "value_type": "Double_array"
+    },
+    {
+      "alias": "flags",
+      "namespace_uri": "urn:minenergy:opccollect:field",
+      "identifier": {"kind": "string", "value": "FLAGS"},
+      "value_type": "Boolean_array"
+    },
+    {
+      "alias": "tags",
+      "namespace_uri": "urn:minenergy:opccollect:field",
+      "identifier": {"kind": "string", "value": "TAGS"},
+      "value_type": "String_array"
+    },
+    {
+      "alias": "blobs",
+      "namespace_uri": "urn:minenergy:opccollect:field",
+      "identifier": {"kind": "numeric", "value": 1102},
+      "value_type": "ByteString_array"
+    }
+  ]
+}

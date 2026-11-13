@@ -7,3 +7,4 @@ minenergy-flight-demo-data = minenergy.flight_demo_data:main
 minenergy-flight-server = minenergy.flight_server:main
 minenergy-generate = minenergy.generate:main
 minenergy-gridtrace = minenergy.gridtrace.cli:main
+minenergy-opccollect = minenergy.opccollect.cli:main
