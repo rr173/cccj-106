@@ -19,6 +19,7 @@ minenergy-compare = "minenergy.compare:main"
 minenergy-flight-server = "minenergy.flight_server:main"
 minenergy-flight-client = "minenergy.flight_client:main"
 minenergy-flight-demo-data = "minenergy.flight_demo_data:main"
+minenergy-comtrade = "minenergy.comtrade.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["minenergy*"]

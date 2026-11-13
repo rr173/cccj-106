@@ -32,7 +32,16 @@ minenergy/
 │   ├── flight.py         # Arrow Flight 服务端（按需扫描事实表、批式 DoGet）
 │   ├── flight_server.py  # 独立前台进程入口（连接现有 store）
 │   ├── flight_client.py  # 演示客户端（schema 发现 / 查询 / DoGet / stats）
-│   └── flight_demo_data.py # 跨多分区/行组/批次的大规模演示数据
+│   ├── flight_demo_data.py # 跨多分区/行组/批次的大规模演示数据
+│   └── comtrade/         # IEEE C37.111-1999 故障录波接入（见第 10 节）
+│       ├── config.py     # CFG 解析/校验、模拟/数字通道、分段采样率、timemult
+│       ├── clock.py      # 时间戳/分段重建、DST 歧义与缺失判定
+│       ├── frames.py     # ASCII/BINARY 流式帧解码（有界内存）
+│       ├── recording.py  # 物理换算、skew、数字解包、窗口/投影/Arrow 批
+│       ├── export.py     # 先检查后暂存的 Parquet 发布与溯源元数据
+│       ├── fixtures.py   # 无外部下载的录波/损坏/大文件夹具
+│       ├── errors.py     # 带文件与帧/样本位置的错误类型
+│       └── cli.py        # catalog / inspect / export / make-fixtures
 ├── samples/
 │   ├── fixtures/         # 6 个命名小样例（生成产物 + settings）
 │   └── randomized/       # 4 批乱序随机样例（生成产物 + settings）
@@ -563,3 +572,123 @@ store（6 只表计、4 个时区、21 天 → 130+ 分钟分区、760+ 行组�
   （共享锁并存）、**两名读者竞争同一笔死事务接管**（不发生共享→排他升级互锁）。
   每个子进程都断言退出状态，所有等待都有截止时间；由 socket 对端逐批核对跨日期
   数值，并核对遗留事务的最终去向（全部收敛、无残留）。
+
+---
+
+## 10. COMTRADE 故障录波接入（IEEE C37.111-1999）
+
+检修拿到的是成对的 `*.cfg` / `*.dat` 高频录波，而不是分钟累计读数。
+`minenergy.comtrade` 把跳闸前后的模拟量与开关量直接加工成 **Arrow / Parquet
+数据**供后续算法使用——**不另算任何分钟指标，也不改动既有能耗 store 的发布协议**。
+
+### 10.1 支持的格式边界
+
+| 维度 | 支持范围 | 边界之外的处理 |
+|---|---|---|
+| 标准修订 | 仅 IEEE C37.111-**1999**（CFG 修订字段必须为 `1999`） | 其他修订年份直接拒绝 |
+| DAT 编码 | **ASCII** 与 **BINARY** 两种 | `BINARY32` / `FLOAT32` 等拒绝 |
+| 二进制帧布局 | 小端：`uint32 序号, uint32 时间戳, N×int16 模拟量, G×uint16 数字字组` | 非小端平台不支持；残帧拒绝 |
+| 数字通道 | 按 CFG 通道顺序解包，字组最低位 = 该组第一个通道，16 通道/字组 | 通道/分组数与帧布局不符即拒绝 |
+| 采样率 | 多段 `samp,endsamp`，结束样本号按**含端点累计计数** | 非递增结束样本号拒绝 |
+| 时间戳 | 全零 → 按 CFG 分段采样率重建；非零 → 乘 `timemult` 后按微秒解释 | 部分为零（首点除外）拒绝，不静默切换 |
+| 时区 | 调用方强制指定 IANA 名 | DST 回拨重复时刻报歧义、春跳缺失时刻报不存在，绝不猜测 |
+| 物理换算 | `a*x+b` 还原标记侧工程量，按 P/S 标记与一次/二次变比换算 | 非正/非有限变比拒绝，结果再校验有限性，杜绝无穷值 |
+| 扩展名 | `.cfg`/`.dat` 大小写不敏感（`wave.CFG` + `wave.DAT` 可用） | 找不到同主干 DAT 拒绝 |
+
+### 10.2 时间解释（最易出错的部分）
+
+1. **非零 DAT 时间戳**：`绝对时刻 = CFG 起始时刻 + 原始时间戳 × timemult`，单位微秒，
+   `timemult` 用 `Fraction` 精确表示，无浮点漂移。
+2. **全零时间戳**：才允许按 CFG 分段采样率重建。第一点相对起始时刻为 0；
+   后一段第一点的偏移 = 前面各整段 `样本数 / 采样率` 之和。例：1000 Hz × 6 点
+   接 500 Hz × 4 点，则第 7 点偏移 = 6/1000 s = 6000 µs。
+3. **混合零时间戳**：除首点（偏移 0，两种模式都合法）外，任何一帧为零而其他帧非零，
+   立即报错并指出帧号/样本号，不允许读到一半切换算法。
+4. **时间回退、序号跳号、末尾残帧**：均带文件路径与帧/样本位置拒绝整个导入。
+5. **时区**：CFG 时刻无时区。回拨（fold 0/1 映射到两个偏移且往返 UTC 仍等于自身）
+   报 *ambiguous*；春跳（往返后墙上时刻改变）报 *does not exist*。
+6. **通道 skew**：每个模拟通道把自己的 `skew`（微秒）加到**自己的**采样时刻；
+   窗口筛选按加 skew 后的时刻进行，不用一个公共时刻覆盖所有通道。
+
+### 10.3 物理量与开关量语义
+
+- 模拟量先用 `y = a*x + b` 还原，`y` 的侧别由 CFG 的 **P/S 标记**决定：
+  `P` 标记表示还原值即一次值（二次 = 一次 × 二次变比/一次变比）；
+  `S` 标记表示还原值即二次值（一次 = 二次 × 一次变比/二次变比）。
+  换算方向严格跟随标记；输出可选 `primary` / `secondary`，任何非有限结果都报错。
+  CFG 的单位、相别、一次/二次变比、P/S 标记全部保留到数据与溯源元数据。
+- 数字位按 CFG 顺序解开，同时给出实际 `state`（0/1）、`normal_state` 与
+  `deviates_from_normal`，调用方可区分“实际电平”和“是否偏离正常态”。
+
+### 10.4 流式读取接口（不吞整文件、不把全部采样变成 Python 对象）
+
+```python
+from minenergy.comtrade import Recording
+
+rec = Recording.open("trip/rec.cfg", timezone="Asia/Shanghai")
+rec.catalog()                       # 通道目录（不读 DAT 内容）
+rec.validate()                      # 全量有界内存导入检查
+
+# 相对触发时刻的闭区间窗口（微秒），可选通道、Arrow 批大小
+for batch in rec.iter_analog_window(
+    start_rel_us=-2000, end_rel_us=4000,
+    channels=["Ia", 2], side="primary", batch_size=8192,
+):
+    ...  # pyarrow.RecordBatch，模拟量按“加 skew 后的时刻”筛选
+for batch in rec.iter_digital_window(-2000, 4000, channels=[17]):
+    ...
+```
+
+读取按 DAT 帧分批（BINARY 用定长块 + `struct` 小端解包，ASCII 逐行），
+内存占用约等于一个批次 + 一个 Arrow RecordBatch，不随文件大小增长
+（`tests/comtrade/test_memory.py` 用峰值 RSS 与 tracemalloc 单笔最大分配双重验证）。
+
+### 10.5 命令
+
+```bash
+# 通道目录
+python -m minenergy.comtrade.cli catalog --cfg path/rec.cfg --timezone UTC
+# 导入检查（不写数据；--json 机器可读）
+python -m minenergy.comtrade.cli inspect --cfg path/rec.cfg --timezone UTC
+# 触发相对窗口分批写 Parquet（先全量检查，再暂存发布）
+python -m minenergy.comtrade.cli export --cfg path/rec.cfg --timezone UTC \
+       --out out/ --start-us -2000 --end-us 4000 \
+       --analog-channels Ia Vb --digital-channels DIG17 \
+       --side primary --batch-size 8192
+# 重新生成离线夹具（无外部下载）
+python -m minenergy.comtrade.cli make-fixtures --out fixtures/
+```
+
+坏文件以退出码 2 拒绝，信息含**出错文件与帧/样本/CFG 行号**。
+
+### 10.6 Parquet 发布与“半份数据”防护
+
+`export_parquet` 先跑一遍有界内存的全量 `validate()`，确认无任何帧级/时间级错误后，
+才把 `analog.parquet` / `digital.parquet` 写到目标旁的私有暂存目录
+（`.tmp-comtrade-*`）；全部写完后 `manifest.json` 原子替换为唯一完成标记。
+任何异常都会删除暂存目录，目标目录永远不会把半份数据呈现为成功导入。
+每个 Parquet 的 schema metadata 与 manifest 都带溯源信息：CFG/DAT 的 SHA-256、
+时间解释方式（时区、时间戳模式、timemult、分段采样率）、物理换算（侧别、a/b、
+变比、P/S 标记）、窗口与通道投影。
+
+### 10.7 离线夹具与演示
+
+`minenergy/comtrade/fixtures.py` 不依赖任何外部下载，生成同一波形的四种编码
+（全零/显式时间戳 × ASCII/BINARY），含两段采样率、不同 skew、正负模拟值、
+int16 极值与 **17 个数字通道（跨两个 uint16 字组，含 D16/D17 字组边界）**；
+损坏样例覆盖截断（ASCII+BINARY）、序号跳号、错通道数、混合零时间戳、时间回退、
+DST 回拨歧义与春跳缺失；另有 ~20 MiB、100 万帧的大录波。
+
+```bash
+# 一条命令：夹具 → 目录 → 四编码检查 → 手算核对 → 窄窗口/投影/分批
+#          → 11 类损坏拒绝 → 暂存 Parquet → 大文件实测峰值内存
+./comtrade_demo.sh /tmp/minenergy-comtrade-demo
+
+# 回归（84 个 COMTRADE 用例 + 既有 104 个用例，共 188 个）
+python -m pytest tests/comtrade -q
+python -m pytest tests -q
+```
+
+大录波实测（参考环境）：DAT 19.1 MiB、100 万帧、流式产出 2100 万行，
+进程峰值 RSS 约 69 MiB，与文件大小解耦；tracemalloc 观测到的单笔最大分配
+保持在单批缓冲量级（约 0.25 MiB），不存在整 DAT 级缓冲。

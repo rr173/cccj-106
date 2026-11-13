@@ -1,6 +1,7 @@
 [console_scripts]
 minenergy = minenergy.cli:main
 minenergy-compare = minenergy.compare:main
+minenergy-comtrade = minenergy.comtrade.cli:main
 minenergy-flight-client = minenergy.flight_client:main
 minenergy-flight-demo-data = minenergy.flight_demo_data:main
 minenergy-flight-server = minenergy.flight_server:main

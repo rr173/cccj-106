@@ -23,6 +23,15 @@ minenergy.egg-info/dependency_links.txt
 minenergy.egg-info/entry_points.txt
 minenergy.egg-info/requires.txt
 minenergy.egg-info/top_level.txt
+minenergy/comtrade/__init__.py
+minenergy/comtrade/cli.py
+minenergy/comtrade/clock.py
+minenergy/comtrade/config.py
+minenergy/comtrade/errors.py
+minenergy/comtrade/export.py
+minenergy/comtrade/fixtures.py
+minenergy/comtrade/frames.py
+minenergy/comtrade/recording.py
 tests/test_crash_recovery.py
 tests/test_fixtures.py
 tests/test_flight.py
