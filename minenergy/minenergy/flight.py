@@ -14,16 +14,26 @@ Design goals
   the result.  Peak memory therefore does not grow with the total result size.
   gRPC itself provides the backpressure: while a client does not consume, the
   generator parks before the next batch.
-* **Query-scoped consistency.**  Every stream (1) settles the store using the
+* **Query-scoped consistency behind one admission boundary.**  Every request
+  first calls :func:`admit_read`, which (1) settles the store using the
   existing publish protocol *before* looking at the tree -- a half-published
-  round is completed, a live publisher is waited for -- and (2) takes a
-  *shared* hold on the store's publish lock (``state/.txn.lock``, the file the
-  commit protocol flocks exclusively).  A publish therefore cannot land between
-  two batches of the same stream; a query that meets a live publisher simply
-  waits.  The hold is released in the stream's ``finally`` clause, so a client
-  that stops reading / cancels / disconnects lets the waiting publisher
-  proceed.  Nothing is cached: the next query re-lists the tree and sees the
-  update that was published meanwhile.
+  round is completed, a live publisher is waited for -- and only then (2)
+  takes a *shared* hold on the store's publish lock (``state/.txn.lock``, the
+  file the commit protocol flocks exclusively) and (3) lets the meter-id
+  decision and every directory scan happen while that hold is held.  Because
+  a fact file leaves the staging area only while a publisher holds the
+  exclusive side of that lock, the shared hold freezes the committed tree for
+  the stream's whole life: a publish cannot land between two batches of the
+  same stream, and a request can never mix two revisions (the failure where
+  recovery ran first, but a publisher moved the first replacement partition
+  before the read lock was taken).  Recovery needs the exclusive lock, so it
+  always runs on a lock-free stack frame -- the shared hold is released first
+  and re-acquired afterwards; the lock is never upgraded in place, which
+  avoids the shared/exclusive upgrade deadlock when several readers are
+  active.  The hold is released in the stream's ``finally`` clause, so a
+  client that stops reading / cancels / disconnects lets the waiting
+  publisher proceed.  Nothing is cached: the next request re-lists the tree
+  and sees the update that was published meanwhile.
 * **Cancellation.**  Client ``cancel``, a disconnected client and server
   shutdown all close the generator; the ``finally`` path closes every parquet
   handle and releases the read hold.  No background work outlives the request.
@@ -426,18 +436,57 @@ def _txn_is_live(directory: Path) -> bool:
         fh.close()
 
 
-def settle_store(root: Path, timeout: float = 300.0) -> None:
-    """Apply the existing recovery protocol before a read, without racing a live job.
+def _txn_state(root: Path) -> list[Path]:
+    """Transaction directories that still need an admission decision.
 
-    * a **prepared, live** transaction is a publisher that is already inside the
-      publish phase: the query waits until it finishes (this is the "query meets
-      a live publisher" coordination);
-    * a **prepared, dead** transaction is a publish that died half-way: the
-      query replays it forward with the normal ``recover_pending`` path;
-    * a **live, un-prepared** transaction is still analysing and has not touched
-      the committed tree: the query may start immediately.  Its own commit will
-      later wait for this stream's shared read hold, so it cannot interleave;
-    * dead un-prepared directories are discarded by ``recover_pending``.
+    A ``COMMITTED`` directory is finished work whose only remaining step is
+    housekeeping; it never changed a file after its marker appeared, so it is
+    not part of the admission decision.  Everything else (prepared manifests
+    without the marker, and un-prepared staging directories) is returned: the
+    caller must establish, under the read hold, whether the owner is alive.
+    """
+    return [
+        d
+        for d in _txn_dirs(root)
+        if not (d / Transaction.COMMITTED).exists()
+    ]
+
+
+def _blocking_txns(root: Path) -> tuple[list[Path], list[Path]]:
+    """Transaction dirs that block admission, split into live vs. dead ones.
+
+    Only a **prepared** directory (manifest present, no ``COMMITTED`` marker)
+    can have moved files into the committed tree, so only prepared
+    directories can make the tree a two-revision mixture.  Un-prepared
+    directories never touched the tree and are irrelevant to the decision.
+    """
+    live: list[Path] = []
+    dead: list[Path] = []
+    for d in _txn_state(root):
+        if not (d / "manifest.json").exists():
+            continue
+        (live if _txn_is_live(d) else dead).append(d)
+    return live, dead
+
+
+# Test seam: the concurrency regression injects timing hooks through this
+# hook.  Production callers never set it, so the hot path stays branch-free.
+admission_hook = None
+
+
+def _hook(point: str) -> None:
+    if admission_hook is not None:
+        admission_hook(point)
+
+
+def settle_store(root: Path, timeout: float = 300.0) -> None:
+    """Settle leftovers *before* a read hold exists (first attempt only).
+
+    This is the unlocked pre-pass: on an idle or analysis-only store it costs
+    nothing, but a directory that changes between this call and the lock
+    acquisition is re-decided by :func:`admit_read` *while the read hold is
+    held*.  Never call recovery from here while holding the read lock:
+    recovery needs the exclusive side of the same lock file.
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -472,6 +521,88 @@ def settle_store(root: Path, timeout: float = 300.0) -> None:
         # Only dead leftovers remain; discard them with the normal protocol.
         recover_pending(root)
         return
+
+
+def admit_read(root: Path, timeout: float = 300.0) -> "FlightReadHold":
+    """Grant a read permit only once txn state and tree contents agree.
+
+    This is the request-admission boundary.  It returns a
+    :class:`FlightReadHold` that must stay open for the whole transfer; the
+    meter-existence decision (and every later directory scan) is valid only
+    while that hold is held.
+
+    Key invariant, derived from the commit protocol in ``storage.py``:
+
+    * a file leaves ``state/txn/<id>/staged/`` for its committed path only
+      inside ``Transaction.commit``/``apply_manifest``, which run under the
+      **exclusive** flock on ``state/.txn.lock``;
+    * the returned hold takes the **shared** flock on that very file.
+
+    Therefore, while the hold is open the committed tree is frozen: no commit
+    can move another fact partition into place.  Admission under the hold has
+    exactly two legal outcomes:
+
+    1. no prepared-but-unmarked transaction exists -> the frozen tree is one
+       complete committed round, admit immediately.  A live *un-prepared*
+       writer is harmless: it has touched only its private staging area, and
+       its future commit blocks on this shared hold;
+    2. a prepared-but-unmarked transaction exists.  If its owner is alive it is
+       inside the publish phase and holds the exclusive lock, so we cannot be
+       holding the shared lock concurrently -- release, wait for it to finish,
+       then re-lock and re-decide.  If every such owner is dead the publish
+       died half-way (the mixed two-revision tree from failure A): release the
+       shared lock, let ``recover_pending`` replay the manifest forward under
+       the exclusive lock, then re-lock and re-decide.
+
+    The hold is never upgraded (shared -> exclusive): recovery always runs on
+    a fresh, lock-free stack frame, so two readers cannot deadlock against
+    each other or against a writer.  The loop terminates because every retry
+    is preceded either by a commit (a finite job reaching its ``COMMITTED``
+    marker) or by a recovery (removing/finishing a dead directory).
+    """
+    root = Path(root)
+    deadline = time.monotonic() + timeout
+    # Unlocked pre-pass: handles the common idle-store case without taking
+    # any lock, and waits out a publisher that is already committing.
+    settle_store(root, timeout=timeout)
+    # Test seam for the exact failure-A window: the store has been settled and
+    # no read hold exists yet, so another process can still publish here.
+    # Production leaves ``admission_hook`` as None and never blocks.
+    _hook("after-settle")
+    while True:
+        _hook("admission-loop-top")
+        hold = FlightReadHold(root)
+        live, dead = _blocking_txns(root)
+        if not live and not dead:
+            # The tree observed under the shared hold is one complete round
+            # and cannot change until this hold is released.
+            _hook("admission-granted")
+            return hold
+        # Someone is/was publishing.  Recovery needs the exclusive side of
+        # this same lock file, so release first -- never upgrade in place.
+        hold.release()
+        if dead:
+            # Prepared-and-dead: finish or discard under the store lock, then
+            # re-admit against the now-settled tree (failure B's takeover).
+            recover_pending(root)
+        else:
+            # Prepared-and-live: the publisher is inside its publish phase.
+            # Wait for it (bounded), then re-check; if it died in the
+            # meantime the next iteration takes the recovery branch.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "timed out waiting for a live publisher to finish: "
+                    + ", ".join(d.name for d in live)
+                )
+            waited_until = min(deadline, time.monotonic() + min(1.0, remaining))
+            while time.monotonic() < waited_until:
+                still_live, _ = _blocking_txns(root)
+                if not still_live:
+                    break
+                time.sleep(0.01)
+        if time.monotonic() > deadline:
+            raise RuntimeError("timed out during read admission")
 
 
 class FlightReadHold:
@@ -685,14 +816,18 @@ class ScanRequest:
     request created.
     """
 
-    def __init__(self, server, doc: dict, query_id: str | None = None):
+    def __init__(self, server, doc: dict, query_id: str | None = None, hold=None):
         self.server = server
         self.root = server.store_root
         self.doc = doc
         self.query_id = query_id or uuid.uuid4().hex
         self.schema = projected_schema(doc["select"])
         self.plan: ScanPlan | None = None
-        self.hold: FlightReadHold | None = None
+        # A permit granted by ``admit_read`` before the transfer started.  When
+        # present it is reused (the admission boundary is crossed exactly once
+        # per request); when absent the generator admits itself, which keeps
+        # ScanRequest usable as a standalone, in-process scanner.
+        self.hold: FlightReadHold | None = hold
         self._handles: list[pq.ParquetFile] = []
         self._started = time.perf_counter()
         self.record = {
@@ -727,15 +862,18 @@ class ScanRequest:
     def stream(self):
         completed = False
         try:
-            # 1. Resolve leftovers before reading: a half-finished publish is
-            #    completed with the existing protocol, a live analysis job is
-            #    let be, and a live publisher is waited for.  Once settled, the
-            #    committed tree is one complete round.
-            settle_store(self.root)
-            # 2. Take the shared read hold.  From here on no completion can
-            #    slip between two batches of this stream.
-            self.hold = FlightReadHold(self.root)
-            # 3. Plan against the tree that recovery has settled.
+            # 1. Cross the admission boundary as a single decision: settle any
+            #    dead transaction (recover under the exclusive lock, never by
+            #    upgrading this reader's shared lock), wait out a live
+            #    publisher, and only then hold the shared read lock.  The
+            #    permit guarantees that the tree seen by the planner -- and by
+            #    every batch emitted below -- is one complete committed round
+            #    and stays frozen until this generator finishes.  When the RPC
+            #    handler already admitted the request, its permit is reused.
+            if self.hold is None:
+                self.hold = admit_read(self.root)
+            # 2. Plan against the settled, frozen tree.  Meter existence is
+            #    therefore decided from the same revision the stream reads.
             plan = plan_scan(
                 self.root, self.doc["meters"], self.doc["start_us"], self.doc["end_us"]
             )
@@ -1052,32 +1190,56 @@ class FlightServiceBase:
             )
         return parse_query(descriptor.command)
 
-    def _validate_meters(self, doc: dict) -> None:
-        validate_meters(self.metrics.store_root, doc["meters"])
+    def _admit_and_validate(self, doc: dict) -> FlightReadHold:
+        """Cross the admission boundary, then judge meter ids under the hold.
+
+        Admission (settle + shared read hold) must precede the meter check:
+        a new meter can be sitting in a dead transaction's staging area, and
+        rejecting it from the un-settled directory would both answer from the
+        wrong revision (failure B) and leave the takeover undone.  The
+        returned permit must be kept alive for the subsequent transfer
+        (``DoGet``) or released once the metadata RPC is answered
+        (``GetFlightInfo``).
+        """
+        hold = admit_read(self.metrics.store_root)
+        try:
+            validate_meters(self.metrics.store_root, doc["meters"])
+        except BaseException:
+            hold.release()
+            raise
+        return hold
 
     def _flight_info(self, descriptor):
         import pyarrow.flight as fl
 
         self.metrics.note_request("flight_info")
         doc = self._query_from_command(descriptor)
-        self._validate_meters(doc)
-        text = canonical_query_text(doc)
-        ticket_text = ticket_with_query_id(text, uuid.uuid4().hex)
-        query_id = json.loads(ticket_text)["query_id"]
-        info = fl.FlightInfo(
-            projected_schema(doc["select"]),
-            fl.FlightDescriptor.for_command(text),
-            [fl.FlightEndpoint(fl.Ticket(ticket_text), [])],
-            app_metadata=json.dumps(
-                {
-                    "query_id": query_id,
-                    "query": json.loads(text),
-                    "schema_version": FACT_SCHEMA_VERSION,
-                },
-                separators=(",", ":"),
-            ).encode(),
-        )
-        return info
+        # Admit first so the UNKNOWN_METER decision uses a settled directory:
+        # a prepared-but-dead job adding a meter is taken over (its partition
+        # moved into place) before the partition list is read.  The metadata
+        # RPC streams no data, so the permit is released once the decision is
+        # made; the later DoGet re-admits and gets a permit for the transfer.
+        hold = self._admit_and_validate(doc)
+        try:
+            text = canonical_query_text(doc)
+            ticket_text = ticket_with_query_id(text, uuid.uuid4().hex)
+            query_id = json.loads(ticket_text)["query_id"]
+            info = fl.FlightInfo(
+                projected_schema(doc["select"]),
+                fl.FlightDescriptor.for_command(text),
+                [fl.FlightEndpoint(fl.Ticket(ticket_text), [])],
+                app_metadata=json.dumps(
+                    {
+                        "query_id": query_id,
+                        "query": json.loads(text),
+                        "schema_version": FACT_SCHEMA_VERSION,
+                    },
+                    separators=(",", ":"),
+                ).encode(),
+            )
+            return info
+        finally:
+            hold.release()
 
     def _descriptor_schema(self, descriptor):
         import pyarrow.flight as fl
@@ -1112,9 +1274,18 @@ class FlightServiceBase:
         except QueryParameterError:
             self.metrics.note_param_error()
             raise
-        self._validate_meters(doc)
+        # Admission happens *before* the GeneratorStream exists: parameter
+        # failures (including UNKNOWN_METER judged from the settled tree) are
+        # therefore raised before a single batch could be transferred, and the
+        # granted permit outlives this call -- ScanRequest releases it in its
+        # own ``finally`` when the transfer ends / is cancelled / errors out.
+        try:
+            hold = self._admit_and_validate(doc)
+        except QueryParameterError:
+            self.metrics.note_param_error()
+            raise
         self.metrics.begin_query()
-        request = ScanRequest(self, doc, query_id=query_id)
+        request = ScanRequest(self, doc, query_id=query_id, hold=hold)
         request.context = context
         gen = request.stream()
 
@@ -1256,6 +1427,8 @@ __all__ = [
     "FlightReadHold",
     "QueryParameterError",
     "ScanRequest",
+    "admission_hook",
+    "admit_read",
     "canonical_query_text",
     "full_schema",
     "make_flight_server",
@@ -1264,6 +1437,7 @@ __all__ = [
     "plan_scan",
     "projected_schema",
     "serve_forever",
+    "settle_store",
     "store_root_or_die",
     "validate_meters",
 ]

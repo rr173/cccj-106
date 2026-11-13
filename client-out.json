@@ -1,0 +1,5 @@
+{
+  "status": "error",
+  "error_type": "FlightUnavailableError",
+  "message": "Flight returned unavailable error, with message: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:443: Failed to connect to remote host: Connection refused"
+}

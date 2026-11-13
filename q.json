@@ -1,0 +1,1 @@
+{"meters":["M0"],"start":"2025-01-01T00:00:00Z","end":"2025-01-03T00:00:00Z","select":["meter_id","local_date","minute_epoch_us","energy_wh"],"batch_size":32}

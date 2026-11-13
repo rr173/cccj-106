@@ -4,6 +4,10 @@ minenergy/canonical.py
 minenergy/cli.py
 minenergy/compare.py
 minenergy/engine.py
+minenergy/flight.py
+minenergy/flight_client.py
+minenergy/flight_demo_data.py
+minenergy/flight_server.py
 minenergy/generate.py
 minenergy/ingest.py
 minenergy/intervals.py
@@ -19,5 +23,7 @@ minenergy.egg-info/dependency_links.txt
 minenergy.egg-info/entry_points.txt
 minenergy.egg-info/requires.txt
 minenergy.egg-info/top_level.txt
+tests/test_crash_recovery.py
 tests/test_fixtures.py
+tests/test_flight.py
 tests/test_incremental.py
