@@ -28,7 +28,11 @@ minenergy/
 │   ├── cli.py            # full / incremental / verify / show
 │   ├── generate.py       # 生成乱序多批输入
 │   ├── ingest.py         # 整目录分批灌入（首批 full，其后 incremental）
-│   └── compare.py        # 增量 vs 全量 vs 参考 三段对照
+│   ├── compare.py        # 增量 vs 全量 vs 参考 三段对照
+│   ├── flight.py         # Arrow Flight 服务端（按需扫描事实表、批式 DoGet）
+│   ├── flight_server.py  # 独立前台进程入口（连接现有 store）
+│   ├── flight_client.py  # 演示客户端（schema 发现 / 查询 / DoGet / stats）
+│   └── flight_demo_data.py # 跨多分区/行组/批次的大规模演示数据
 ├── samples/
 │   ├── fixtures/         # 6 个命名小样例（生成产物 + settings）
 │   └── randomized/       # 4 批乱序随机样例（生成产物 + settings）
@@ -394,3 +398,131 @@ python -m minenergy.cli show --store /tmp/demo_store --table runs
 - 无效区间总时长 == 事实表 `invalid_us` 总和（无效不丢秒）；
 - 每表计每分钟 `coverage_us ≤ 60 000 000`、无零覆盖行、`is_zero_usage ⇒ valid_us>0`；
 - 分钟键集合与参考实现完全一致（**没有采样的分钟不会被填成 0**）。
+
+---
+
+## 9. Arrow Flight 事实数据服务
+
+分析团队可以**直接从另一台机器**消费事实数据，不需要复制 store 目录，也不需要
+解析终端表格：服务把已提交的 `facts/` 分区树作为只读、按需扫描的数据集暴露为
+Arrow Flight。它只做传输，不新增/修改任何能耗指标（分钟事实仍由 `minutes.py`
+按原规则生成）。
+
+### 9.1 启动（独立前台进程）
+
+```bash
+# 对现有 store 起服务（只读；同一 store 上的 full / incremental 照常可写）
+python -m minenergy.flight_server --store /tmp/demo_store --host 127.0.0.1 --port 8815
+#   端口 0（默认）由系统分配；进程启动后打印一行 JSON：
+#   {"status":"ready","store":...,"host":...,"port":...,"location":"grpc://..."}
+```
+
+`--store` 必须是已存在的事实 store（有 `facts/` 树）。服务是只读的：发布方
+（`minenergy.cli full|incremental|ingest`）与它可同时运行。
+
+### 9.2 查询参数
+
+```json
+{
+  "meters": ["M0", "M2"],
+  "start": "2025-01-01T00:00:00Z",
+  "end":   "2025-01-02T00:00:00+08:00",
+  "select": ["meter_id", "minute_start_utc", "energy_wh"],
+  "batch_size": 8192
+}
+```
+
+| 键 | 含义 | 默认值 / 上限 |
+|---|---|---|
+| `meters` | 表号数组，**必须非空**，不能“串流所有表号”；每个表号必须已有 `meter_id=` 分区 | 必填；≤256 个，不得重复 |
+| `start` | 对事实行的 **UTC 分钟起点**（`minute_epoch_us`）的闭区间下界；**必须带偏移**（`Z` / `+hh:mm` / `+hhmm`） | 必填 |
+| `end` | 同一键的开区间上界；同样必须带偏移 | 必填；必须 `> start` |
+| `select` | 需要的列名数组，**按请求顺序返回**并保持存储 Arrow 类型；不含 `start`/`end`/`meters` 之外任何隐式列 | `null`/省略 = 全部 20 列，按存储顺序；≤20 列，不得重复 |
+| `batch_size` | 每个 `RecordBatch` 的目标行数 | `8192`；允许 `1..65536` |
+
+不支持未列出的键。`meters` 是**显式列表**，没有“全表号”通配模式。
+
+### 9.3 RPC 用法
+
+| RPC | 用法 |
+|---|---|
+| `GetSchema` | `FlightDescriptor.for_path("facts")` → 完整事实 schema；`for_command(query)` → 该查询投影后的 schema |
+| `GetFlightInfo` | 命令描述符 = 查询 JSON：**先校验参数**，再返回 `FlightInfo`（投影 schema、单一 ticket endpoint、`app_metadata` 含 `query_id`） |
+| `DoGet` | ticket = 查询 JSON（`GetFlightInfo` 会给它加上同一个 `query_id`）→ `RecordBatch` 流；每批 `app_metadata` 带 `query_id` / `batch_index` |
+| `DoAction` | `minenergy.stats` → 计数器与最近查询记录（扫描文件数、行组取舍、行/字节、峰值内存、当前打开文件与活跃查询）；`minenergy.health` → 存活信息 |
+| `ListFlights` | 返回一张 `facts` flight 供发现 |
+
+**空结果也带正确 schema**：`GeneratorStream` 在传输开始前就声明投影 schema，
+所以 0 行结果仍能拿到列名与类型（`read_all()` 得到 0 行、schema 与 `FlightInfo` 一致）。
+
+**参数错误在传输开始前被拒绝**：未知列、重复列、倒置/相等区间、无偏移时间、
+越界 `batch_size`、未知表号、未知键、空 `meters` 全部在 `GetFlightInfo`/`DoGet`
+入口校验，失败 RPC 消息以 `MINENERGY_PARAM_INVALID:` 开头并带
+`{"code": ...}`，`DoGet` 侧呈现为 gRPC `INVALID_ARGUMENT`。扫描器在参数通过后
+才创建，因此不存在“传到一半才报错”。
+
+### 9.4 扫描、内存与一致性
+
+- **先裁剪再读**：先按 `meter_id=` 分区裁剪（无关表号的目录根本不打开），再用
+  parquet 行组 `minute_epoch_us` 统计量裁剪时间范围，只读取选中的行组；然后
+  在 int64 过滤键上做一次 `[start,end)` 过滤、按请求顺序投影。为了满足小列投影，
+  内部会额外读取过滤键，但它**不会出现在返回列**中。
+- **不做“先全读进 Polars/Pandas 再切块”**：逐行组、逐批生成 `RecordBatch`，
+  内存占用约等于一个批次 + 一个行组的投影列，不随总结果线性增长（见 9.6）。
+- **一次流 = 完整一轮数据**：`DoGet` 开始时先按既有提交协议处理遗留未完成发布
+  （`recover_pending`），再对 `state/.txn.lock` 取**共享读锁**（发布方用同一
+  文件的排他锁）。因此发布不会插进同一流的两个批次之间：流前几批与后几批来自
+  同一轮。查询遇到**存活发布者**会等待其完成；遇到仍在分析、尚未触碰已提交树的
+  写方则可以直接读上一轮完整数据（该写方提交时会被流的共享读锁挡住）。
+- **取消/断网即释放**：客户端取消、断开或服务关机都会关闭生成器；其 `finally`
+  关闭所有 parquet 句柄并释放共享读锁（统计接口的 `open_parquet_files` /
+  `active_queries` 归零），等待中的发布随即可以提交。没有后台任务残留。
+- **下一条查询看到更新**：不缓存文件或结果；每次查询重新列目录并重新裁剪，
+  因此随后完成的发布对新查询可见。不要求持久快照、断点续传或离线副本。
+
+### 9.5 客户端示例
+
+```bash
+# schema 发现
+python -m minenergy.flight_client --uri grpc://127.0.0.1:8815 --schema
+
+# 窄时间段 + 列投影，逐批消费 DoGet
+python -m minenergy.flight_client --uri grpc://127.0.0.1:8815 \
+  --meters M0 --start 2024-01-02T03:00:00Z --end 2024-01-02T04:00:00Z \
+  --select meter_id minute_start_utc energy_wh valid_seconds --batch-size 20
+
+# 机器可读（含 batch 元数据与可选服务端统计）
+python -m minenergy.flight_client --uri grpc://127.0.0.1:8815 \
+  --meters M0 --start 2024-01-01T00:00:00Z --end 2024-01-05T00:00:00Z --json --stats
+```
+
+`minenergy.flight_client` 同时提供 `connect / discover_schema / run_query /
+query_records / server_stats / expect_param_error`，验收脚本与测试复用它，
+与人工使用走完全相同的 RPC 路径。
+
+### 9.6 一条命令跑完 Flight 演示与验收
+
+```bash
+./flight_demo.sh /tmp/minenergy-flight-demo
+```
+
+脚本会：用 `minenergy.flight_demo_data` 造一份**跨多分区、行组、批次**的真实
+store（6 只表计、4 个时区、21 天 → 130+ 分钟分区、760+ 行组、18 万分钟事实）；
+在真实端口启动 `minenergy.flight_server`；用真实 Flight 客户端演示 schema 发现、
+窄范围列投影、空结果 schema、非法参数 `INVALID_ARGUMENT`、两个消费者不同表号
+并发，并打印服务端的实际扫描观测（被裁掉的行组/文件、批大小、峰值内存）。
+
+`python -m pytest tests/test_flight.py -q` 覆盖以下**真实端口、真实客户端**的验收点：
+
+- schema 与存储 parquet 完全一致；投影 schema 与返回类型/列序一致；
+- 半开区间按 UTC 分钟起点解释（含秒级边界、带偏移时间串）；
+- 空结果的 schema 正确；
+- 未知列 / 重复列 / 倒置区间 / 无偏移时间 / 过大 `batch_size` / 未知表号 /
+  未知键均以带 `MINENERGY_PARAM_INVALID` 与 `INVALID_ARGUMENT` 的 RPC 错误拒绝，
+  且失败请求不会产生任何流记录；
+- 两个消费者请求不同表号时数据严格隔离；
+- 慢消费者流中途取消后：另一个查询完成、等待中的写入完成、句柄与读锁归零；
+- 用同步点安排“流已打开”与“发布开始”：发布被挡住直到流结束，同一流内数据不
+  混版，随后新查询读到更新；
+- 崩溃留下的 prepared-but-unmarked 发布在查询前被既有协议补完（只补一次）；
+- 大目录扫描只触及相关分区与行组，全程投影/宽投影的峰值内存不随总结果量线性增长。

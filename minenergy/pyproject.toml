@@ -16,6 +16,9 @@ test = ["pytest>=8"]
 minenergy = "minenergy.cli:main"
 minenergy-generate = "minenergy.generate:main"
 minenergy-compare = "minenergy.compare:main"
+minenergy-flight-server = "minenergy.flight_server:main"
+minenergy-flight-client = "minenergy.flight_client:main"
+minenergy-flight-demo-data = "minenergy.flight_demo_data:main"
 
 [tool.setuptools.packages.find]
 include = ["minenergy*"]

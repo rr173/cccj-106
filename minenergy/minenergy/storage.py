@@ -86,13 +86,28 @@ from .schema import (
     RAW_SAMPLE_DTYPES,
 )
 
+# Minute facts are written in row groups of at most this many rows.  A local
+# day has 1440 minutes per meter, so this splits a busy partition into
+# pruneable chunks without changing any value or the file's schema.
+FACT_ROW_GROUP_SIZE = 240
 
-def _write_atomic(df: pl.DataFrame, path: Path) -> None:
+
+def _write_atomic(
+    df: pl.DataFrame, path: Path, row_group_size: int | None = None
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".parquet", dir=path.parent)
     os.close(fd)
     try:
-        df.write_parquet(tmp, compression="zstd", statistics=True)
+        if row_group_size is None:
+            df.write_parquet(tmp, compression="zstd", statistics=True)
+        else:
+            df.write_parquet(
+                tmp,
+                compression="zstd",
+                statistics=True,
+                row_group_size=int(row_group_size),
+            )
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -177,10 +192,12 @@ class Transaction:
         return self.dir / self.COMMITTED
 
     # ---- recording ------------------------------------------------------
-    def put_parquet(self, df: pl.DataFrame, target: Path) -> None:
+    def put_parquet(
+        self, df: pl.DataFrame, target: Path, row_group_size: int | None = None
+    ) -> None:
         rel = self._rel(target)
         staged = self._staged_path(rel)
-        _write_atomic(df, staged)
+        _write_atomic(df, staged, row_group_size=row_group_size)
         self.ops[rel] = {"action": "write", "staged": "staged/" + rel}
 
     def staged_for(self, target: Path) -> Path | None:
@@ -307,6 +324,16 @@ def recover_pending(root: Path) -> list[str]:
     """
     base = Path(root) / "state" / "txn"
     if not base.exists():
+        return []
+    # Nothing to repair: do not take the store-wide exclusive lock.  This keeps
+    # readers (including the Flight service's shared read holds) from
+    # serialising on an idle store; a directory created after this check
+    # belongs to a live job, which recovery must not touch anyway.
+    try:
+        candidates = [d for d in base.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    except OSError:
+        candidates = []
+    if not candidates:
         return []
     with _store_lock(root):
         return _recover_locked(base)
@@ -452,11 +479,13 @@ class Store:
         """Finish or discard work left by an earlier process (see module docs)."""
         return recover_pending(self.root)
 
-    def _put(self, df: pl.DataFrame, path: Path) -> None:
+    def _put(
+        self, df: pl.DataFrame, path: Path, row_group_size: int | None = None
+    ) -> None:
         if self._txn is not None:
-            self._txn.put_parquet(df, path)
+            self._txn.put_parquet(df, path, row_group_size=row_group_size)
         else:
-            _write_atomic(df, path)
+            _write_atomic(df, path, row_group_size=row_group_size)
 
     def _put_text(self, text: str, path: Path) -> None:
         if self._txn is not None:
@@ -603,7 +632,10 @@ class Store:
         ).items():
             meter_id, timezone, local_date = keys
             path = self._partition_path(self.root / "facts", meter_id, timezone, local_date)
-            self._put(part, path)
+            # Split fact partitions into multiple row groups so a reader can
+            # prune by minute range instead of decompressing the whole local
+            # day.  No value or schema changes; only the parquet layout.
+            self._put(part, path, row_group_size=FACT_ROW_GROUP_SIZE)
             written.append(path)
         return written
 

@@ -47,3 +47,6 @@ done
 
 echo "== pytest suite"
 "$PY" -m pytest "$HERE/tests" -q
+
+echo "== Arrow Flight service (real store, real port, real client)"
+"$HERE/flight_demo.sh" "$WORK/flight"
