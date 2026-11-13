@@ -42,6 +42,20 @@ minenergy/
 │       ├── fixtures.py   # 无外部下载的录波/损坏/大文件夹具
 │       ├── errors.py     # 带文件与帧/样本位置的错误类型
 │       └── cli.py        # catalog / inspect / export / make-fixtures
+├── minenergy/gridtrace/  # 配电网追溯：历史来源/瞬间追线/故障演练（见第 11 节）
+│       ├── model.py      # 接点/连线/源/挂表/操作簿数据结构（无向多重图）
+│       ├── timeutil.py   # 带偏移 ISO 时刻 <-> UTC 微秒（朴素时刻拒绝）
+│       ├── loader.py     # 本地 JSON schema 载入与带定位的全量校验
+│       ├── graph.py      # BFS 连通分量与字典序最短路径
+│       ├── snapshot.py   # 接线快照与按发生时刻的整体回放
+│       ├── tracing.py    # source_history / trace_routes / drill 三类业务操作
+│       ├── arrow.py      # 三张结果表的显式 PyArrow schema 与 Parquet 落盘
+│       ├── oracle.py     # 独立对照：自含回放 + 全枚举简单路径（不调模块搜索）
+│       ├── randomgen.py  # 随机接线/操作组合（平行边、环、自环、孤立表）
+│       ├── scenario.py   # 值班案例（两源/联络环/平行线/孤立表）+ 手算依据
+│       ├── errors.py     # 带清册下标与操作编号的聚合错误类型
+│       └── cli.py        # history / trace / drill / make-case / demo
+├── gridtrace_demo.sh     # 一条命令在新临时目录重建案例并跑完验收
 ├── samples/
 │   ├── fixtures/         # 6 个命名小样例（生成产物 + settings）
 │   └── randomized/       # 4 批乱序随机样例（生成产物 + settings）
@@ -692,3 +706,140 @@ python -m pytest tests -q
 大录波实测（参考环境）：DAT 19.1 MiB、100 万帧、流式产出 2100 万行，
 进程峰值 RSS 约 69 MiB，与文件大小解耦；tracemalloc 观测到的单笔最大分配
 保持在单批缓冲量级（约 0.25 MiB），不存在整 DAT 级缓冲。
+
+---
+
+## 11. 配电网追溯（gridtrace）
+
+值班员处理“A 路检修后某只表仍有电——是联络线接替还是 B 路也接在它上面？
+再退 B 路哪些表受影响？”这一类工单。答案**只来自接线模型与倒闸操作回放**，
+不用能耗大小猜测，也不改动读数加工（第 2–9 节）与录波解码（第 10 节）。
+模块只依赖标准库与 PyArrow，输入是本地 JSON，不需要网络采集。
+
+### 11.1 接线模型 JSON schema
+
+接线按**无向多重图**理解：两点间允许平行多根线、允许闭环与自环；同一接点
+可挂多只表或多个源。所有时刻必须是**带 UTC 偏移**的 ISO 8601 字符串。
+
+```json
+{
+  "base_time": "2026-01-01T00:00:00Z",
+  "nodes":   [{"id": "N1", "name": "1号母线"}],
+  "lines":   [{"id": "E1", "kind": "switch", "endpoint_a": "N1",
+               "endpoint_b": "N2", "initial_state": "closed"}],
+  "sources": [{"id": "SA", "node_id": "N1", "initial_state": "engaged"}],
+  "meters":  [{"id": "M1", "node_id": "N1"}]
+}
+```
+
+| 清册 | 字段 | 取值 / 约束 |
+|---|---|---|
+| 顶层 | `base_time` | 带偏移时刻；查询早于它一律报错 |
+| `nodes` | `id` / `name` | ID 清册内唯一；`name` 用于追线展示 |
+| `lines` | `kind` | `wire`（常接导线，无 `initial_state`）/ `switch`（开关，必须给初态） |
+| | `endpoint_a/b` | 必须是接点清册内的接点，否则按**悬空接线**拒绝 |
+| `sources` | `node_id` / `initial_state` | 挂接接点须存在；状态 `engaged`/`retired` |
+| `meters` | `node_id` | 挂接接点须存在；孤立表（无任何连线）合法，查询时标失电而非消失 |
+
+ID 只要求**各清册内**不可重号；未知字段、错误枚举、朴素时刻、重号、悬空
+端点都会聚合为带定位（如 `lines[3].endpoint_b`、`nodes[7].id`）的错误整体
+拒绝，不省略坏记录继续给答案。
+
+### 11.2 操作簿 JSON schema 与回放语义
+
+```json
+{"operations": [
+  {"at_time": "2026-01-01T05:00:00Z", "op_id": "OP31",
+   "target_kind": "switch", "target_id": "E1", "new_state": "open"}
+]}
+```
+
+* 记录只能操纵**开关**（`new_state` 为 `closed/open`）与**源**
+  （`engaged/retired`）；常接导线只能在故障演练里被临时拔掉；
+* 文件顺序可打乱，语义按 `at_time` 回放；**同一瞬间的全部动作整体作用于
+  接线后才观察供电**，不会凭行顺序制造临时失电；
+* 基准时刻是“尚未应用当刻操作的初态”，当刻记录参与回放，更早的记录报错；
+* 同刻同目标被要求两种状态 → 列明相互矛盾的操作编号与记录位置并停止；
+  `op_id` 完全一致的重传忽略，编号复用但内容修改 → 拒绝。
+
+### 11.3 三类业务操作（均可直接从 Python 调用）
+
+```python
+from minenergy.gridtrace import (
+    load_model, load_ledger, Replay,
+    source_history, trace_routes, drill,
+    history_to_arrow, routes_to_arrow, drill_to_arrow, write_parquet,
+)
+
+model = load_model("grid_model.json")
+ledger = load_ledger("operations.json", model)
+replay = Replay(model, ledger)                       # 按发生时刻整体回放
+
+# 1) 历史：[start, end) 左含右不含；失电段显式保留；邻接段来源集合一致即归并
+segments = source_history(replay, "M3",
+                          "2026-01-01T00:00:00Z", "2026-01-01T07:00:00Z")
+
+# 2) 追线：每个可达源一条 (节点名/节点号 + 边号) 有序路线；
+#    最少边数优先，同长按整条边号序列字典序决胜；按被点中瞬间的快照还原
+routes = trace_routes(replay, "M6", "2026-01-01T05:30:00Z")
+
+# 3) 演练：临时拔线/退源，逐表分 dead / degraded / unchanged，带前后来源集合
+result = drill(replay, "2026-01-01T04:30:00Z",
+               remove_lines=("P1",), remove_sources=("SB",))
+
+# PyArrow 接出并落 Parquet（显式 schema，zstd，原子替换）
+write_parquet(history_to_arrow("M3", segments), "out/history.parquet")
+write_parquet(routes_to_arrow("M6", result_at_us, routes), "out/routes.parquet")
+write_parquet(drill_to_arrow(result), "out/drill.parquet")
+```
+
+关键语义：
+
+| 规则 | 行为 |
+|---|---|
+| 失电 | 一个源也到不了标 `powered=false`/空来源集；孤立表照常出现在结果里 |
+| 双路并供 | 来源集合列出两个源；归并按集合比较，与顺序无关 |
+| 归并 | 每张表时段连贯不重叠；邻接两段来源集合一致即合并，**换路但电源没变不切行** |
+| 追线还原 | 归并段内部走线可能改过；追线总是重建被点中瞬间的快照，不复用归并段首条路线 |
+| 演练隔离 | 在派生快照上拔线/退源，正式操作簿与回放器不变，演练后重查历史得原答案 |
+
+### 11.4 值班案例与独立对照
+
+`minenergy/gridtrace/scenario.py` 固化一套手算案例：两个源、一圈联络线、
+N4–N6 一对平行常接导线、一只孤立表，挂表覆盖支路（M5/M6）与公共接点
+（M1/M3）。四个工单：
+
+1. 两源并供 → 退一源 → 全断 → 同刻双源恢复（含失电段保留与孤立表）；
+2. 同刻断旧路 E1、合新路 E7：整段有电、历史归并为一段，归并段内部两个
+   瞬间追线分别给出 `[E2,E1]` 与 `[E7]`；
+3. M5 的等长平行路线按整条边号序列字典序取 P1；逐根拔 P1/P2 验证备用
+   连接仍有效，两根齐拔支路才失电；
+4. 退源 + 断支路逐表核对三类影响，再重复正常追溯确认无任何污染。
+
+独立对照 `oracle.py` **不 import 模块自身的图搜索或回放函数**：自己回放
+状态、自己 DFS **枚举全部简单路径**后按 `(边数, 边号序列)` 取最优。
+`tests/gridtrace/test_oracle_crosscheck.py` 在 60 组随机接线/操作组合上，
+对三种业务操作逐字段比对（随机图含平行边、闭环、自环、同接点多表多源、
+孤立接点），并断言 oracle 源码无禁用依赖、演练不改变正式答案。
+
+### 11.5 命令与验收
+
+```bash
+# 一条命令：新临时目录重建案例 -> 四工单终端核对 -> Parquet -> gridtrace 测试
+./gridtrace_demo.sh /tmp/gridtrace-demo
+
+# 或分步调用（三种业务操作都支持 --json 与 --parquet）
+python -m minenergy.gridtrace.cli make-case --out /tmp/case
+python -m minenergy.gridtrace.cli history --model /tmp/case/grid_model.json \
+       --ledger /tmp/case/operations.json --meter M3 \
+       --start 2026-01-01T00:00:00Z --end 2026-01-01T07:00:00Z
+python -m minenergy.gridtrace.cli trace   ... --meter M6 --at 2026-01-01T05:30:00Z
+python -m minenergy.gridtrace.cli drill   ... --at 2026-01-01T04:30:00Z \
+       --remove-lines P1 P2
+python -m pytest tests/gridtrace -q       # 手算工单 + 拒绝案例 + 随机对照 + Arrow/CLI
+```
+
+坏输入（重号、悬空、枚举错误、朴素时刻、编号碰撞、同刻矛盾、非法演练
+对象等）以退出码 2 拒绝，信息带对象/记录定位。gridtrace 与既有读数/录波
+功能完全解耦：`python -m pytest tests -q` 跑全量回归（含第 10 节 COMTRADE
+与 Flight 套件）互不影响。
