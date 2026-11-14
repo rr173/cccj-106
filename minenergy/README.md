@@ -65,8 +65,18 @@ minenergy/
 │       ├── demo.py         # 现场断线演练编排（真实子进程 + 断言）
 │       ├── errors.py       # 带节点与原因的错误类型
 │       └── cli.py          # run / query / inspect / fixture
+├── minenergy/orchestrator/ # 本地数据作业编排器：DAG × 有限日期集合（见第 13 节）
+│       ├── definition.py   # 作业定义校验、占位符替换、按日期展开实例
+│       ├── store.py        # SQLite 编排记录（运行/逻辑作业/每次进程尝试）
+│       ├── wrapper.py      # 单次尝试的包装进程：超时、进程组、结果文件
+│       ├── process.py      # Linux 进程识别（pid+starttime）与进程组终止
+│       ├── controller.py   # 控制器：调度循环、并行上限、重试、取消、接手
+│       ├── demo_jobs.py    # 可控加工命令（演练与测试共用）
+│       ├── demo.py         # 夜班演练驱动（真实数据链 + 全部故障场景）
+│       └── cli.py          # plan / create / start / resume / status / cancel / rerun
 ├── gridtrace_demo.sh     # 一条命令在新临时目录重建案例并跑完验收
 ├── opccollect_demo.sh    # 一条命令跑完 OPC UA 现场断线演练与验收
+├── nightshift_demo.sh    # 一条命令从空目录跑完夜班演练 + 全量回归
 ├── samples/
 │   ├── fixtures/         # 6 个命名小样例（生成产物 + settings）
 │   └── randomized/       # 4 批乱序随机样例（生成产物 + settings）
@@ -1004,3 +1014,197 @@ python -m minenergy.opccollect.cli fixture --opc-port 4840 --control-port 4841 \
 `python -m pytest tests/opccollect -q` 覆盖契约/类型边界、接收语义、断线
 重连、退避有界性、故障注入、SQLite/Arrow 往返与 CLI 子进程；`tests/` 全量
 回归（含原有全部套件）互不影响。
+
+---
+
+## 13. 本地数据作业编排器（orchestrator）
+
+夜班补跑离线数据的典型形态是：先准备每一天的采样文件和倍率，再算能耗，
+核对通过后才能交给下游；旁边还可能挂着一条录波转换支路——它失败不该让
+已经核对好的日期重做。编排器把这张**有向无环的依赖表**变成真的可执行、
+可停下、可接手的一次运行：使用者提交一份作业定义和若干 `YYYY-MM-DD`
+数据日期，编排器按依赖顺序起子进程、记录每一次真实进程尝试，并在控制
+器退出后能从 SQLite 记录接着走。
+
+边界（明确不做的事）：只面向**有限日期集合的离线加工**；不是常驻定时服
+务，不提供网页；不修改既有读数算法与 store 的跨文件事务（能耗加工仍走
+`minenergy.cli full/incremental`，核对仍走 `minenergy.cli verify`，编排
+器只是把它们的命令行按依赖表跑起来）；不要求分布式执行。
+
+### 13.1 作业定义与启动前校验
+
+定义是一份 JSON：节点给出唯一名称、前置节点、参数数组、工作目录、超时
+和允许的总尝试次数；`limits` 给出全局并行上限与各项默认值。
+
+```json
+{
+  "name": "night-shift",
+  "limits": {"max_parallel": 3, "default_timeout_seconds": 600,
+             "default_max_attempts": 2, "retry_delay_seconds": 0.5,
+             "term_grace_seconds": 3.0},
+  "nodes": [
+    {"name": "samples",
+     "args": ["python3", "-m", "minenergy.generate", "--out",
+              "{run_dir}/input/{date}", "--scenario", "randomized"],
+     "timeout_seconds": 120},
+    {"name": "energy", "depends_on": ["samples"],
+     "args": ["python3", "-m", "minenergy.cli", "full",
+              "--store", "{run_dir}/store/{date}", "..."]},
+    {"name": "check", "depends_on": ["energy"],
+     "args": ["python3", "-m", "minenergy.cli", "verify", "..."]}
+  ]
+}
+```
+
+| 规则 | 语义 |
+|---|---|
+| 参数数组 | **直接交给子进程**（`execvp` 语义），不经过 shell；要传环境变量可用 `["env", "A=B", "..."]` |
+| 占位符 | 只认 `{date}`（数据日期）与 `{run_dir}`（本次运行目录）；**未知占位符或落单花括号拒绝整份定义** |
+| 依赖 | 只连接**同一天**的节点；不同日期各自形成独立实例，互不等待 |
+| 启动前检查 | 循环、悬空依赖、重名、重复日期、非法超时/尝试次数/并行上限全部一次性报出；**坏定义不会启动半张图**（`plan` 只列不建，`create/start` 单事务落库） |
+| 定义快照 | 一次运行绑定创建时的完整定义（canonical JSON + sha256 入库）；**之后改定义文件不改变已建立的运行**，`resume` 只读库内快照 |
+
+`plan` 在启动前列出将执行的每个实例（替换后的 argv、cwd、限制）和依赖
+边，供人工核对。
+
+### 13.2 SQLite 编排记录与状态机
+
+一次运行一个目录：
+
+```
+<run_dir>/orchestrator.sqlite        编排记录（WAL，运行中可并发只读查询）
+<run_dir>/controller.lock            执行权锁（flock）
+<run_dir>/definition.snapshot.json   定义快照
+<run_dir>/logs/<日期>--<节点>/attempt-g<代>-<序号>.{stdout,stderr}.log
+                                     .{result,meta}.json / .wrapper.log
+```
+
+跟踪两类实体：**逻辑作业**（`日期+节点`，含替换后的 argv、限制、当前
+`generation`）与**进程尝试**（每一次真实进程：启动/结束时间、退出码或
+信号、独立 stdout/stderr 文件、失败原因、包装进程与加工进程的
+`(pid, starttime)` 身份）。尝试记录与日志**只追加不覆盖**——重跑产生新
+`generation`，序号在新代内重新计，旧日志原地保留。
+
+作业状态：`pending`（等前置）→ `ready`（可运行）→ `running`（执行中）；
+失败后在额度内进 `retry_wait`（等待重试），额度耗尽进 `failed`；前置失
+败/取消的作业进 `blocked`（`blocked_by` 指明被哪个失败作业挡住，沿依赖
+链追到根因）；整次运行取消时未完成的进 `cancelled`；尝试结果不可确定时
+进 `interrupted`（见 13.4）。终态还有 `succeeded`。
+
+**成功只认该次进程真实的退出码 0**：包装进程把加工进程的退出码/信号原
+子写入结果文件，控制器只凭结果文件判定。输出文件已存在、日志里打印了
+"完成"字样，都不算成功（演练里的 `liar` 节点专门验证这一点）。不依赖
+失败节点的分支和其他日期照常继续。
+
+### 13.3 并行上限与重试
+
+`max_parallel` 是本产品自己的并行进程上限：控制器只在"运行中尝试数 <
+上限"时才启动新实例，接手的旧尝试也计入。非零退出或超时消耗一次尝试额
+度，在 `max_attempts`（**总尝试次数**，含第一次）内按 `retry_delay_seconds`
+延迟重试；额度耗尽作业判 `failed`，其后继显示 `blocked_by`，其余分支
+与其他日期不受影响。超时由包装进程执行：先向加工进程的**整个进程组**
+发 SIGTERM，宽限（`term_grace_seconds`）后仍存活的组收 SIGKILL。
+
+### 13.4 接手旧运行（崩溃恢复）
+
+执行权由 `<run_dir>/controller.lock` 的 `flock(LOCK_EX|LOCK_NB)` 保证：
+锁随进程死亡自动释放，**两个控制器同时接手同一运行时只有一个取得执行
+权**，另一个被明确拒绝（退出码 5）且不改任何状态。进程身份**不只凭
+PID**：记录 `/proc/<pid>/stat` 的 starttime 令牌，PID 被系统复用时身份
+校验失败（这是声明的 Linux 进程识别边界，不声称分布式互斥）。
+
+新控制器启动时逐条分类上次留下的在途尝试，**绝不是把执行中改回待执行**：
+
+| 现场 | 处理 |
+|---|---|
+| 包装进程还活着（pid+starttime 匹配） | **收养**：等它结束并读结果文件，按真实退出码记账；旧加工进程不会被再启动一份 |
+| 包装已死但结果文件存在 | 结果文件是原子写的完整记录，直接采用（覆盖"子进程刚结束、结果已落盘"） |
+| 包装已死且无结果文件 | 结果不可知：尝试记 `interrupted` 并保留加工进程组身份；**不猜成功、不自动重试** |
+
+`interrupted` 的作业停在那里等使用者确认：系统核实旧尝试的进程组**已不
+再运行**后才接受 `rerun`；若旧进程还活着，`rerun` 被明确拒绝。控制器
+遇到未决的 `interrupted` 会以退出码 4 停下（运行保持 active），其余分
+支照常跑完。
+
+### 13.5 取消与重跑
+
+`cancel` 先置标志（控制器下一轮即停止启动新实例），再对在途尝试**按进
+程组**终止（TERM → 宽限 → KILL），因此**父加工进程被取消不会留下它派
+生的子进程继续写**。取消是幂等的：重复取消报告"已取消"，不制造新尝试。
+若发起取消时控制器已死，取消命令自己取得执行权并完成终止。
+
+`rerun --date D --node N` 让指定"日期+节点"及**同日所有后继**的成功资
+格失效（`generation` 递增、状态按存活前置重算），前置的成功与不相关分
+支、其他日期**都可复用不重跑**；该范围内还有活跃尝试、或上次中断尝试
+的进程组仍活着时，重跑被拒绝。运行状态与允许的操作：
+
+| 运行状态 | 允许的操作 |
+|---|---|
+| `active`（含正在执行） | `status` / `cancel` / `rerun`（范围内无活跃尝试时）/ `resume`（无其他控制器时） |
+| `completed` / `failed` | `status` / `rerun`（运行回到 active 待 `resume` 执行）/ `resume`（无事可做时直接报告现状，不产生新尝试）/ `cancel`（no-op） |
+| `cancelled` | 仅 `status`；`cancel` 幂等 no-op；`rerun`/`resume` 拒绝 |
+
+### 13.6 恰好一次的声明边界
+
+编排器保证的是**记录层面的恰好一次**：一个 `succeeded` 作业恰好有一条
+真实退出码 0 的尝试记录，每次尝试的日志与退出状态都可回溯。它**不声称
+任意数据加工实现了恰好一次副作用**：被杀在半路或结果丢失后重试的加工
+进程，其外部副作用（写文件、改库）可能已部分生效；下游应凭 SQLite 记
+录的尝试结果判断，而不是凭输出文件是否存在。
+
+### 13.7 命令与 Python 接口
+
+```bash
+minenergy-orchestrate plan    --definition def.json --dates 2025-01-01 2025-01-02
+minenergy-orchestrate create  --definition def.json --dates ... --run-dir RUN
+minenergy-orchestrate start   --definition def.json --dates ... --run-dir RUN  # 创建并前台执行
+minenergy-orchestrate resume  --run-dir RUN     # 接手已有运行
+minenergy-orchestrate status  --run-dir RUN [--json]
+minenergy-orchestrate cancel  --run-dir RUN
+minenergy-orchestrate rerun   --run-dir RUN --date 2025-01-01 --node check
+```
+
+退出码：`0` 全部成功；`1` 运行结束但有失败/被阻塞作业；`2` 定义或用法
+错误；`3` 已取消；`4` 仍有中断作业待确认；`5` 另一控制器持有执行权。
+
+```python
+from minenergy.orchestrator import (
+    load_definition, validate_dates, plan_lines,   # 定义加载/校验/展开
+    create_run, execute_run, start_run,            # 创建与执行
+    cancel_run, rerun_job, run_status,             # 操作与查询
+    Controller, RunStore,                          # 控制器与记录层
+    DefinitionError, ControllerConflictError, RunStateError,
+)
+```
+
+### 13.8 夜班演练
+
+```bash
+./nightshift_demo.sh /tmp/minenergy-nightshift
+```
+
+从空目录重建并逐条断言（恢复全程**不删库、不清状态**，只走 `resume`）：
+
+1. **真实数据链**：两个日期各跑 `generate → cli full → cli verify →
+   collect 交付`，另挂 COMTRADE 录波转换支路；某一日期的录波文件损坏，
+   支路两次尝试都以真实退出码 2 失败、后继 `blocked`，而两个日期的主链
+   不受影响、已核对的日期不重做；最后直接读回已落盘的分钟事实 Parquet
+   与交付清单核对；
+2. **重跑范围**：只重跑某日期的 `check`，断言它与后继 `deliver` 重新执
+   行、前置与其他日期原样复用；
+3. **可控加工**：分叉汇合（汇合节点的时间戳晚于两路）、两日期交错且
+   不串目录、flaky 第一次失败第二次成功（两次尝试都留档）、持续失败隔
+   离、只认退出码的"谎报完成"节点；执行次序（trace 文件）、实际退出状
+   态与 SQLite 记录三方对照；
+4. **超时与取消**：超时的派生任务整组被终止、取消后没有遗留加工（孙
+   进程的文件永不出现、`/proc` 扫描为空）、重复取消幂等；
+5. **真实终止控制器再接手**：`kill -9` 控制器后旧子进程仍活着，新控制
+   器收养而非重复执行（同一作业始终只有一次尝试，成功来自真实退出
+   码）；再杀掉包装进程制造"结果不可知"，断言中断事实保留、旧进程活
+   着时重跑被拒、确认死亡后重跑成功；
+6. **并发接手**：两个控制器只有一个取得执行权；
+7. **定义安全**：循环/悬空/重名/重复日期/未知占位符/非法限制逐一拒
+   绝且不建运行目录；建立运行后修改定义文件不影响该运行。
+
+脚本最后跑 `tests/` 全量回归（含 `tests/orchestrator` 的 30 个用例与原
+项目全部套件）。
